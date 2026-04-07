@@ -54,12 +54,37 @@ import kotlinx.serialization.json.intOrNull
 import okhttp3.WebSocketListener
 
 private val matterTimeout = 2.minutes
+private val REGISTRY_CACHE_TTL = 5.minutes.inWholeMilliseconds
+private val SUBSCRIPTION_KEEPALIVE = kotlin.time.Duration.INFINITE
 
 class WebSocketRepositoryImpl internal constructor(
     private val webSocketCore: WebSocketCore,
     private val serverManager: ServerManager,
 ) : WebSocketListener(),
     WebSocketRepository {
+
+    private data class CachedResult<T>(val data: T, val timestamp: Long)
+
+    @Volatile
+    private var cachedAreaRegistry: CachedResult<List<AreaRegistryResponse>>? = null
+
+    @Volatile
+    private var cachedDeviceRegistry: CachedResult<List<DeviceRegistryResponse>>? = null
+
+    @Volatile
+    private var cachedEntityRegistry: CachedResult<List<EntityRegistryResponse>>? = null
+
+    private fun <T> getCached(cached: CachedResult<T>?): T? {
+        if (cached == null) return null
+        val isFresh = System.currentTimeMillis() - cached.timestamp < REGISTRY_CACHE_TTL
+        val isConnected = webSocketCore.getConnectionState() == WebSocketState.Active
+        // Return cached data if fresh, or if stale but WebSocket is not connected
+        // (better to show stale data than wait for reconnection)
+        if (isFresh || !isConnected) {
+            return cached.data
+        }
+        return null
+    }
 
     override fun getConnectionState(): WebSocketState {
         return webSocketCore.getConnectionState()
@@ -145,33 +170,39 @@ class WebSocketRepositoryImpl internal constructor(
     }
 
     override suspend fun getAreaRegistry(): List<AreaRegistryResponse>? {
+        getCached(cachedAreaRegistry)?.let { return it }
         val socketResponse = webSocketCore.sendMessage(
             mapOf(
                 "type" to "config/area_registry/list",
             ),
         )
-
-        return mapResponse(socketResponse)
+        return mapResponse<List<AreaRegistryResponse>>(socketResponse)?.also {
+            cachedAreaRegistry = CachedResult(it, System.currentTimeMillis())
+        }
     }
 
     override suspend fun getDeviceRegistry(): List<DeviceRegistryResponse>? {
+        getCached(cachedDeviceRegistry)?.let { return it }
         val socketResponse = webSocketCore.sendMessage(
             mapOf(
                 "type" to "config/device_registry/list",
             ),
         )
-
-        return mapResponse(socketResponse)
+        return mapResponse<List<DeviceRegistryResponse>>(socketResponse)?.also {
+            cachedDeviceRegistry = CachedResult(it, System.currentTimeMillis())
+        }
     }
 
     override suspend fun getEntityRegistry(): List<EntityRegistryResponse>? {
+        getCached(cachedEntityRegistry)?.let { return it }
         val socketResponse = webSocketCore.sendMessage(
             mapOf(
                 "type" to "config/entity_registry/list",
             ),
         )
-
-        return mapResponse(socketResponse)
+        return mapResponse<List<EntityRegistryResponse>>(socketResponse)?.also {
+            cachedEntityRegistry = CachedResult(it, System.currentTimeMillis())
+        }
     }
 
     override suspend fun getEntityRegistryFor(entityId: String): EntityRegistryResponse? {
@@ -288,10 +319,14 @@ class WebSocketRepositoryImpl internal constructor(
         subscribeToTrigger("state", mapOf("entity_id" to entityIds))
 
     override suspend fun getCompressedStateAndChanges(): Flow<CompressedStateChangedEvent>? =
-        webSocketCore.subscribeTo(SUBSCRIBE_TYPE_SUBSCRIBE_ENTITIES)
+        webSocketCore.subscribeTo(SUBSCRIBE_TYPE_SUBSCRIBE_ENTITIES, timeout = SUBSCRIPTION_KEEPALIVE)
 
     override suspend fun getCompressedStateAndChanges(entityIds: List<String>): Flow<CompressedStateChangedEvent>? =
-        webSocketCore.subscribeTo(SUBSCRIBE_TYPE_SUBSCRIBE_ENTITIES, mapOf("entity_ids" to entityIds))
+        webSocketCore.subscribeTo(
+            SUBSCRIBE_TYPE_SUBSCRIBE_ENTITIES,
+            mapOf("entity_ids" to entityIds),
+            timeout = SUBSCRIPTION_KEEPALIVE,
+        )
 
     override suspend fun getAreaRegistryUpdates(): Flow<AreaRegistryUpdatedEvent>? =
         subscribeToEventsForType(EVENT_AREA_REGISTRY_UPDATED)
@@ -302,8 +337,13 @@ class WebSocketRepositoryImpl internal constructor(
     override suspend fun getEntityRegistryUpdates(): Flow<EntityRegistryUpdatedEvent>? =
         subscribeToEventsForType(EVENT_ENTITY_REGISTRY_UPDATED)
 
-    private suspend fun <T : Any> subscribeToEventsForType(eventType: String): Flow<T>? =
-        webSocketCore.subscribeTo(SUBSCRIBE_TYPE_SUBSCRIBE_EVENTS, mapOf("event_type" to eventType))
+    private suspend fun <T : Any> subscribeToEventsForType(eventType: String): Flow<T>? {
+        return webSocketCore.subscribeTo(
+            SUBSCRIBE_TYPE_SUBSCRIBE_EVENTS,
+            mapOf("event_type" to eventType),
+            timeout = SUBSCRIPTION_KEEPALIVE,
+        )
+    }
 
     override suspend fun getTemplateUpdates(template: String): Flow<TemplateUpdatedEvent>? =
         webSocketCore.subscribeTo(SUBSCRIBE_TYPE_RENDER_TEMPLATE, mapOf("template" to template))

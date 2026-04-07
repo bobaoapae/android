@@ -232,6 +232,58 @@ class WebSocketRepositoryImplTest {
         }
     }
 
+    @Nested
+    inner class RegistryCache {
+
+        @Test
+        fun `Given area registry already cached when getAreaRegistry then does not call WebSocket`() = runTest {
+            // First call - populates cache
+            val fakeResponse = mockk<io.homeassistant.companion.android.common.data.websocket.impl.entities.RawMessageSocketResponse>(relaxed = true)
+            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) } returns fakeResponse
+            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            // mapResponse will return null for our mock, but getAreaRegistry will cache null and try again
+            // Instead, let's verify the caching behavior by calling twice and checking sendMessage count
+            repository.getAreaRegistry()
+            repository.getAreaRegistry()
+
+            // Should only call sendMessage once (second call uses cache)
+            coVerify(exactly = 1) { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) }
+        }
+
+        @Test
+        fun `Given WebSocket disconnected and cache exists when getAreaRegistry then returns cached data`() = runTest {
+            // First call with active connection to populate cache
+            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            repository.getAreaRegistry()
+
+            // Now simulate disconnection - cache should still be used even if stale
+            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.ClosedOther
+
+            repository.getAreaRegistry()
+
+            // Still only 1 WebSocket call because cache is used when disconnected
+            coVerify(exactly = 1) { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) }
+        }
+
+        @Test
+        fun `Given device registry already cached when getDeviceRegistry then does not call WebSocket`() = runTest {
+            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            repository.getDeviceRegistry()
+            repository.getDeviceRegistry()
+
+            coVerify(exactly = 1) { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/device_registry/list" }) }
+        }
+
+        @Test
+        fun `Given entity registry already cached when getEntityRegistry then does not call WebSocket`() = runTest {
+            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            repository.getEntityRegistry()
+            repository.getEntityRegistry()
+
+            coVerify(exactly = 1) { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/entity_registry/list" }) }
+        }
+    }
+
     private fun createServer(deviceRegistryId: String? = null): Server {
         return Server(
             id = 1,

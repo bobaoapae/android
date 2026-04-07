@@ -25,18 +25,56 @@ import timber.log.Timber
 
 @RequiresApi(Build.VERSION_CODES.S)
 object CameraControl : HaControl {
+
+    /** In-memory cache of camera thumbnails by entity ID */
+    private val thumbnailCache = mutableMapOf<String, Bitmap>()
+
+    /** Timestamp of last fetch per entity ID */
+    private val lastFetchTime = mutableMapOf<String, Long>()
+
+    /**
+     * Pre-fetch a camera thumbnail in background. Called by WebsocketManager.
+     * @param isInternal true if on local network (refresh more often)
+     */
+    fun prefetchThumbnail(
+        entityId: String,
+        baseUrl: String,
+        entityPicture: String,
+        isInternal: Boolean,
+        force: Boolean = false,
+    ) {
+        val now = System.currentTimeMillis()
+        if (!force) {
+            val interval = if (isInternal) 10_000L else 600_000L // 10s local, 10min external
+            val lastFetch = lastFetchTime[entityId] ?: 0L
+            if (now - lastFetch < interval) return
+        }
+        lastFetchTime[entityId] = now
+        try {
+            val bitmap = BitmapFactory.decodeStream(URL(baseUrl + entityPicture).openStream())
+            if (bitmap != null) {
+                thumbnailCache[entityId] = bitmap
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Couldn't prefetch thumbnail for $entityId")
+        }
+    }
+
     override fun provideControlFeatures(
         context: Context,
         control: Control.StatefulBuilder,
         entity: Entity,
         info: HaControlInfo,
     ): Control.StatefulBuilder {
-        val image = if (info.baseUrl != null &&
-            (entity.attributes["entity_picture"] as? String)?.isNotBlank() == true
-        ) {
-            getThumbnail(info.baseUrl + entity.attributes["entity_picture"] as String)
-        } else {
-            null
+        val entityPicture = entity.attributes["entity_picture"] as? String
+        // Use cached thumbnail (always available after first prefetch)
+        var image = thumbnailCache[entity.entityId]
+        // If no cache and baseUrl available, try to fetch synchronously (first time only)
+        if (image == null && info.baseUrl != null && entityPicture?.isNotBlank() == true) {
+            image = getThumbnail(info.baseUrl + entityPicture)
+            if (image != null) {
+                thumbnailCache[entity.entityId] = image
+            }
         }
         val icon = if (image != null) {
             Icon.createWithBitmap(image)

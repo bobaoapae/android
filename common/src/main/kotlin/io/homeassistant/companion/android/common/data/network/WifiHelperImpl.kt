@@ -43,4 +43,11 @@ class WifiHelperImpl @Inject constructor(
 
     override fun getWifiBssid(): String? =
         wifiManager?.connectionInfo?.bssid // Deprecated but callback doesn't provide BSSID info instantly
+
+    override fun getWifiSignalStrength(): Int? {
+        if (!isUsingWifi()) return null
+        val rssi = wifiManager?.connectionInfo?.rssi ?: return null
+        // rssi of -127 or Integer.MIN_VALUE indicates no valid signal
+        return if (rssi <= -127) null else rssi
+    }
 }

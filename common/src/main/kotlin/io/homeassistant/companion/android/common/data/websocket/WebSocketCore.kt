@@ -79,8 +79,16 @@ internal class WebSocketCoreFactory @Inject constructor(
     private val serverManagerProvider: Provider<ServerManager>,
 ) {
 
+    private val wsClient by lazy {
+        okHttpClient.newBuilder()
+            .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
     fun create(serverId: Int): WebSocketCore {
-        return WebSocketCoreImpl(okHttpClient, serverManagerProvider.get(), serverId)
+        return WebSocketCoreImpl(wsClient, serverManagerProvider.get(), serverId)
     }
 }
 

@@ -97,7 +97,7 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import timber.log.Timber
 
-private val DELAY_BEFORE_RECONNECT = 10.seconds
+private val DELAY_BEFORE_RECONNECT = 1.seconds
 
 /**
  * Implementation of the [WebSocketCore] interface for managing WebSocket connections to a Home Assistant server.

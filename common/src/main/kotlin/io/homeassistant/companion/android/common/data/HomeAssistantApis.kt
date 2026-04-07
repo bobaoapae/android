@@ -72,6 +72,7 @@ class HomeAssistantApis @Inject constructor(
 
         builder.callTimeout(CALL_TIMEOUT, TimeUnit.SECONDS)
         builder.readTimeout(READ_TIMEOUT, TimeUnit.SECONDS)
+        builder.retryOnConnectionFailure(true)
 
         tlsHelper.setupOkHttpClientSSLSocketFactory(builder)
 

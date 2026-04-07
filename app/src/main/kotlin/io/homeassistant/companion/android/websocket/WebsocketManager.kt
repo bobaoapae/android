@@ -25,9 +25,11 @@ import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.components.SingletonComponent
 import io.homeassistant.companion.android.BuildConfig
 import io.homeassistant.companion.android.common.R
+import io.homeassistant.companion.android.common.data.integration.applyCompressedStateDiff
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.util.CHANNEL_WEBSOCKET
 import io.homeassistant.companion.android.common.util.CHANNEL_WEBSOCKET_ISSUES
+import io.homeassistant.companion.android.controls.HaControlsProviderService
 import io.homeassistant.companion.android.database.settings.SettingsDao
 import io.homeassistant.companion.android.database.settings.WebsocketSetting
 import io.homeassistant.companion.android.notifications.MessagingManager
@@ -39,6 +41,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -101,6 +105,7 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
     private val serverManager: ServerManager = entryPoint.serverManager()
     private val messagingManager: MessagingManager = entryPoint.messagingManager()
     private val settingsDao: SettingsDao = entryPoint.settingsDao()
+    private val entitySyncJobs = mutableMapOf<Int, Job>()
 
     @EntryPoint
     @InstallIn(SingletonComponent::class)
@@ -131,6 +136,8 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
 
         jobs.forEach { it.value.cancel() }
         jobs.clear()
+        entitySyncJobs.forEach { it.value.cancel() }
+        entitySyncJobs.clear()
 
         Timber.d("Done listening to Websocket")
 
@@ -184,10 +191,107 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
                 jobs[it.id] = coroutineScope.launch { collectNotifications(it.id) }
             }
 
+        // Keep control entities synced in background
+        servers.forEach { server ->
+            val entityIds = HaControlsProviderService.lastControlEntityIds[server.id]
+            if (!entityIds.isNullOrEmpty() && server.id !in entitySyncJobs) {
+                entitySyncJobs[server.id] = coroutineScope.launch { syncControlEntities(server.id, entityIds) }
+            }
+        }
+        // Clean up finished sync jobs
+        entitySyncJobs.entries.removeAll { !it.value.isActive }
+        // Prefetch camera thumbnails in background
+        servers.forEach { server ->
+            coroutineScope.launch { prefetchCameraThumbnails(server.id) }
+        }
+
         return true // for while
     }
 
+    private suspend fun prefetchRegistries(serverId: Int) {
+        try {
+            coroutineScope {
+                val a = async { serverManager.webSocketRepository(serverId).getAreaRegistry() }
+                val d = async { serverManager.webSocketRepository(serverId).getDeviceRegistry() }
+                val e = async { serverManager.webSocketRepository(serverId).getEntityRegistry() }
+                a.await()
+                d.await()
+                e.await()
+            }
+            Timber.d("Prefetched registries for server $serverId")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to prefetch registries for server $serverId")
+        }
+    }
+
+    private suspend fun prefetchCameraThumbnails(serverId: Int) {
+        val baseUrl = HaControlsProviderService.lastBaseUrl[serverId] ?: return
+        val isInternal = try {
+            serverManager.connectionStateProvider(serverId).isInternal(requiresUrl = false)
+        } catch (e: Exception) {
+            false
+        }
+
+        HaControlsProviderService.cachedEntities.values
+            .filter { it.domain == "camera" }
+            .forEach { entity ->
+                val entityPicture = entity.attributes["entity_picture"] as? String
+                if (!entityPicture.isNullOrBlank()) {
+                    try {
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                            io.homeassistant.companion.android.controls.CameraControl.prefetchThumbnail(
+                                entity.entityId,
+                                baseUrl,
+                                entityPicture,
+                                isInternal,
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Timber.e(e, "Failed to prefetch thumbnail for ${entity.entityId}")
+                    }
+                }
+            }
+    }
+
+    private suspend fun syncControlEntities(serverId: Int, entityIds: List<String>) {
+        try {
+            Timber.d("Starting background entity sync for ${entityIds.size} entities on server $serverId")
+            val entities = mutableMapOf<String, io.homeassistant.companion.android.common.data.integration.Entity>()
+
+            // Populate from existing cache
+            entityIds.forEach { id ->
+                HaControlsProviderService.cachedEntities[id]?.let { entities[id] = it }
+            }
+
+            serverManager.webSocketRepository(serverId).getCompressedStateAndChanges(entityIds)
+                ?.collect { event ->
+                    event.added?.forEach {
+                        val entity = it.value.toEntity(it.key)
+                        entities[it.key] = entity
+                        HaControlsProviderService.cachedEntities[it.key] = entity
+                    }
+                    event.changed?.forEach {
+                        val entity = entities[it.key]?.applyCompressedStateDiff(it.value)
+                        entity?.let { updated ->
+                            entities[it.key] = updated
+                            HaControlsProviderService.cachedEntities[it.key] = updated
+                        }
+                    }
+                    event.removed?.forEach {
+                        entities.remove(it)
+                        HaControlsProviderService.cachedEntities.remove(it)
+                    }
+                }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.e(e, "Error syncing control entities for server $serverId")
+        }
+    }
+
     private suspend fun collectNotifications(serverId: Int) {
+        // Pre-fetch registries as soon as WebSocket connects so controls open instantly
+        prefetchRegistries(serverId)
         serverManager.webSocketRepository(serverId).getNotifications()?.collect {
             if (it.containsKey("hass_confirm_id")) {
                 try {

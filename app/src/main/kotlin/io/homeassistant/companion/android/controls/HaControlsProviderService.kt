@@ -74,6 +74,16 @@ class HaControlsProviderService : ControlsProviderService() {
                 domainToMinimumApi[it] == null ||
                     Build.VERSION.SDK_INT >= domainToMinimumApi[it]!!
             }
+
+        /** Cache of last known entity states, survives service recreation */
+        internal val cachedEntities = mutableMapOf<String, Entity>()
+
+        /** Last known control IDs per server, used by WebsocketManager to keep entities synced */
+        internal val lastControlEntityIds = mutableMapOf<Int, List<String>>()
+
+        /** Last resolved base URL per server, used for instant cached control rendering */
+        @Volatile
+        internal var lastBaseUrl = mutableMapOf<Int, String>()
     }
 
     @Inject
@@ -188,12 +198,20 @@ class HaControlsProviderService : ControlsProviderService() {
             subscriber.onSubscribe(object : Flow.Subscription {
                 val webSocketScope = CoroutineScope(Dispatchers.IO)
                 override fun request(n: Long) {
+                    // Send cached controls IMMEDIATELY (synchronous, no coroutine dispatch)
+                    sendCachedControlsImmediately(controlIds, subscriber)
+
+                    // Force camera thumbnail refresh in background, then re-send camera controls
+                    ioScope.launch {
+                        refreshCameraThumbnails(controlIds, subscriber)
+                    }
+
+                    // Then launch async work for live updates
                     ioScope.launch {
                         if (!serverManager.isRegistered()) return@launch else Timber.d("request $n")
 
                         controlIds
                             .groupBy {
-                                // Controls added before multiserver don't have a server ID, assume the first
                                 it.split(".")[0].toIntOrNull()
                                     ?: serverManager.servers().firstOrNull()?.id
                             }.forEach { (serverId, serverControlIds) ->
@@ -291,10 +309,14 @@ class HaControlsProviderService : ControlsProviderService() {
             return
         }
 
-        // Load up initial values
+        // Resolve all initial data in parallel (registries are cached, baseUrl is fast)
         val getAreaRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getAreaRegistry() }
         val getDeviceRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getDeviceRegistry() }
         val getEntityRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getEntityRegistry() }
+        val getBaseUrl = ioScope.async {
+            serverManager.connectionStateProvider(serverId).urlFlow().firstUrlOrNull()?.toString()?.removeSuffix("/")
+                ?: ""
+        }
         val entityIds = controlIds.map {
             if (it.split(".")[0].toIntOrNull() != null) {
                 it.removePrefix("$serverId.")
@@ -302,14 +324,21 @@ class HaControlsProviderService : ControlsProviderService() {
                 it
             }
         }
-        val entities = mutableMapOf<String, Entity>()
-        val baseUrl =
-            serverManager.connectionStateProvider(serverId).urlFlow().firstUrlOrNull()?.toString()?.removeSuffix("/")
-                ?: ""
+        // Save entity IDs so WebsocketManager can keep them synced in background
+        lastControlEntityIds[serverId] = entityIds
 
         areaRegistry[serverId] = getAreaRegistry.await()
         deviceRegistry[serverId] = getDeviceRegistry.await()
         entityRegistry[serverId] = getEntityRegistry.await()
+        val baseUrl = getBaseUrl.await()
+        lastBaseUrl[serverId] = baseUrl
+
+        // Cached controls were already sent synchronously in request().
+        // Populate entities map from cache so live updates can apply diffs correctly.
+        val entities = mutableMapOf<String, Entity>()
+        entityIds.forEach { entityId ->
+            cachedEntities[entityId]?.let { entities[entityId] = it }
+        }
 
         if (serverManager.integrationRepository(serverId).isHomeAssistantVersionAtLeast(2022, 4, 0)) {
             webSocketScope.launch {
@@ -350,11 +379,18 @@ class HaControlsProviderService : ControlsProviderService() {
                                 toSend["ha_failed.$missingEntity"] = entity
                             }
                         }
-                        Timber.d("Sending ${toSend.size} entities to subscriber")
+                        // Update static cache for instant display on next open
+                        toSend.forEach { (key, entity) ->
+                            if (!key.startsWith("ha_failed.")) {
+                                cachedEntities[entity.entityId] = entity
+                            }
+                        }
+                        // Always re-send ALL entities so Android doesn't mark unchanged ones as stale
+                        Timber.d("Sending all ${entities.size} entities to subscriber (${toSend.size} changed)")
                         sendEntitiesToSubscriber(
                             subscriber,
                             controlIds,
-                            toSend,
+                            entities,
                             serverId,
                             serverName,
                             webSocketScope,
@@ -504,10 +540,16 @@ class HaControlsProviderService : ControlsProviderService() {
             }
         }
         val splitMultiServersIntoStructures = splitMultiServersIntoStructures()
+        Timber.d("sendEntitiesToSubscriber: sending ${entities.size} entities, controlIds=${controlIds.size}")
         entities.forEach {
-            coroutineScope.launch {
+            val idx = entityIds.indexOf(it.value.entityId)
+            if (idx == -1) {
+                Timber.e("Entity ${it.value.entityId} not found in entityIds, skipping")
+                return@forEach
+            }
+            try {
                 val info = HaControlInfo(
-                    systemId = controlIds[entityIds.indexOf(it.value.entityId)],
+                    systemId = controlIds[idx],
                     entityId = it.value.entityId,
                     serverId = serverId,
                     serverName = serverName,
@@ -533,8 +575,77 @@ class HaControlsProviderService : ControlsProviderService() {
                 if (control != null) {
                     subscriber.onNext(control)
                 }
+            } catch (e: Exception) {
+                Timber.e(e, "sendEntitiesToSubscriber: failed for entity ${it.value.entityId}")
             }
         }
+    }
+
+    /**
+     * Send cached controls synchronously in request() so Android never shows "loading".
+     * No suspend, no coroutine dispatch — runs directly on the calling thread.
+     */
+    @RequiresApi(Build.VERSION_CODES.S)
+    private suspend fun refreshCameraThumbnails(
+        controlIds: MutableList<String>,
+        subscriber: Flow.Subscriber<in Control>,
+    ) {
+        controlIds.forEach { controlId ->
+            try {
+                val serverId = controlId.split(".")[0].toIntOrNull() ?: return@forEach
+                val entityId = controlId.removePrefix("$serverId.")
+                if (!entityId.startsWith("camera.")) return@forEach
+                val entity = cachedEntities[entityId] ?: return@forEach
+                val baseUrl = lastBaseUrl[serverId] ?: return@forEach
+                val entityPicture = entity.attributes["entity_picture"] as? String ?: return@forEach
+
+                // Force refresh
+                CameraControl.prefetchThumbnail(entityId, baseUrl, entityPicture, isInternal = true, force = true)
+
+                // Re-send the camera control with fresh thumbnail
+                val info = HaControlInfo(
+                    systemId = controlId,
+                    entityId = entityId,
+                    serverId = serverId,
+                    area = getAreaForEntity(entityId, serverId),
+                    baseUrl = baseUrl,
+                )
+                val control = domainToHaControl["camera"]?.createControl(applicationContext, entity, info)
+                if (control != null) {
+                    subscriber.onNext(control)
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to refresh camera thumbnail for $controlId")
+            }
+        }
+    }
+
+    private fun sendCachedControlsImmediately(
+        controlIds: MutableList<String>,
+        subscriber: Flow.Subscriber<in Control>,
+    ) {
+        if (cachedEntities.isEmpty()) return
+        controlIds.forEach { controlId ->
+            try {
+                val serverId = controlId.split(".")[0].toIntOrNull() ?: return@forEach
+                val entityId = controlId.removePrefix("$serverId.")
+                val entity = cachedEntities[entityId] ?: return@forEach
+                val domain = entityId.split(".")[0]
+                val haControl = domainToHaControl[domain] ?: return@forEach
+                val info = HaControlInfo(
+                    systemId = controlId,
+                    entityId = entityId,
+                    serverId = serverId,
+                    area = getAreaForEntity(entityId, serverId),
+                    baseUrl = lastBaseUrl[serverId],
+                )
+                val control = haControl.createControl(applicationContext, entity, info)
+                subscriber.onNext(control)
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to send cached control for $controlId")
+            }
+        }
+        Timber.d("Sent ${controlIds.size} cached controls immediately")
     }
 
     private fun getFailedEntity(entityId: String, exception: Exception): Entity {

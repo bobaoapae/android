@@ -172,8 +172,23 @@ class ServerConnectionStateProviderImplTest {
             )
             every { wifiHelper.isUsingSpecificWifi(listOf("HomeWiFi")) } returns true
             every { wifiHelper.isUsingWifi() } returns true
+            every { wifiHelper.getWifiSignalStrength() } returns -50
 
             assertTrue(provider.isInternal())
+        }
+
+        @Test
+        fun `Given SSID configured and using matching WiFi but weak signal when calling isInternal then returns false`() = runTest {
+            val provider = createServerConnectionStateProvider(
+                externalUrl = "https://external.example.com",
+                internalUrl = "http://192.168.1.1:8123",
+                internalSsids = listOf("HomeWiFi"),
+            )
+            every { wifiHelper.isUsingSpecificWifi(listOf("HomeWiFi")) } returns true
+            every { wifiHelper.isUsingWifi() } returns true
+            every { wifiHelper.getWifiSignalStrength() } returns -85
+
+            assertFalse(provider.isInternal())
         }
 
         @Test
@@ -253,6 +268,7 @@ class ServerConnectionStateProviderImplTest {
             every { networkHelper.isUsingVpn() } returns false
             every { wifiHelper.isUsingSpecificWifi(listOf("HomeWiFi")) } returns true
             every { wifiHelper.isUsingWifi() } returns true
+            every { wifiHelper.getWifiSignalStrength() } returns -50
             every {
                 ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
             } returns PackageManager.PERMISSION_GRANTED

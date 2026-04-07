@@ -66,7 +66,15 @@ class ServerConnectionStateProviderImpl @AssistedInject constructor(
             val usesInternalSsid = wifiHelper.isUsingSpecificWifi(connection.internalSsids)
             val usesWifi = wifiHelper.isUsingWifi()
             Timber.d("usesInternalSsid is: $usesInternalSsid, usesWifi is: $usesWifi")
-            usesInternalSsid && usesWifi
+            if (!usesInternalSsid || !usesWifi) return false
+            // Check WiFi signal strength - if very weak, treat as external to proactively switch
+            val rssi = wifiHelper.getWifiSignalStrength()
+            val hasStrongEnoughSignal = rssi == null || rssi > WifiHelper.WEAK_WIFI_THRESHOLD
+            Timber.d(
+                "WiFi RSSI: $rssi dBm, strongEnough: $hasStrongEnoughSignal" +
+                    " (threshold: ${WifiHelper.WEAK_WIFI_THRESHOLD})",
+            )
+            hasStrongEnoughSignal
         } else {
             false
         }
