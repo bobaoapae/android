@@ -26,12 +26,14 @@ object ClimateControl : HaControl {
         "cool" to TemperatureControlTemplate.MODE_COOL,
         "heat" to TemperatureControlTemplate.MODE_HEAT,
         "heat_cool" to TemperatureControlTemplate.MODE_HEAT_COOL,
+        "auto" to TemperatureControlTemplate.MODE_HEAT_COOL,
         "off" to TemperatureControlTemplate.MODE_OFF,
     )
     private val temperatureControlModeFlags = mapOf(
         "cool" to TemperatureControlTemplate.FLAG_MODE_COOL,
         "heat" to TemperatureControlTemplate.FLAG_MODE_HEAT,
         "heat_cool" to TemperatureControlTemplate.FLAG_MODE_HEAT_COOL,
+        "auto" to TemperatureControlTemplate.FLAG_MODE_HEAT_COOL,
         "off" to TemperatureControlTemplate.FLAG_MODE_OFF,
     )
     private val climateStates = HashMap<String, ClimateState>()
@@ -81,16 +83,21 @@ object ClimateControl : HaControl {
             )
             var modesFlag = 0
             (entity.attributes["hvac_modes"] as? List<String>)?.forEach {
-                modesFlag = modesFlag or temperatureControlModeFlags[it]!!
+                val flag = temperatureControlModeFlags[it]
+                if (flag != null) {
+                    modesFlag = modesFlag or flag
+                }
                 state.supportedModes.add(it)
             }
             this.climateStates[info.systemId] = state
+            val currentMode = temperatureControlModes[entity.state]
+                ?: TemperatureControlTemplate.MODE_OFF
             control.setControlTemplate(
                 TemperatureControlTemplate(
                     info.systemId,
                     toggleRangeTemplate,
-                    temperatureControlModes[entity.state]!!,
-                    temperatureControlModes[entity.state]!!,
+                    currentMode,
+                    currentMode,
                     modesFlag,
                 ),
             )
@@ -149,13 +156,17 @@ object ClimateControl : HaControl {
                 }
                 val supportedModes = this.climateStates[action.templateId]!!.supportedModes
                 val currentMode = this.climateStates[action.templateId]!!.currentMode
-                val nextMode = (supportedModes.indexOf(currentMode) + 1) % supportedModes.count()
+                // Only cycle through modes that Android can display
+                val mappableModes = supportedModes.filter { temperatureControlModes.containsKey(it) }
+                if (mappableModes.isEmpty()) return false
+                val currentIndex = mappableModes.indexOf(currentMode)
+                val nextMode = if (currentIndex == -1) 0 else (currentIndex + 1) % mappableModes.count()
                 integrationRepository.callAction(
                     entityStr.split(".")[0],
                     "set_hvac_mode",
                     hashMapOf(
                         "entity_id" to entityStr,
-                        "hvac_mode" to supportedModes[nextMode],
+                        "hvac_mode" to mappableModes[nextMode],
                     ),
                 )
                 true
@@ -168,18 +179,19 @@ object ClimateControl : HaControl {
 
     private fun entityShouldBePresentedAsThermostat(entity: Entity): Boolean =
         (entity.attributes["hvac_modes"] as? List<String>).let { modes ->
-            temperatureControlModes.containsKey(entity.state) &&
-                modes?.isNotEmpty() == true &&
-                modes.any { it == entity.state } &&
-                modes.all { temperatureControlModes.containsKey(it) } &&
+            modes?.isNotEmpty() == true &&
+                // At least one mode must be mappable to Android's TemperatureControlTemplate
+                modes.any { temperatureControlModes.containsKey(it) } &&
+                // Current state must be mappable (or treat unmapped states as off)
+                (temperatureControlModes.containsKey(entity.state) || entity.state in modes) &&
                 (
                     (
-                        (entity.attributes["supported_features"] as Int) and SUPPORT_TARGET_TEMPERATURE ==
-                            SUPPORT_TARGET_TEMPERATURE
+                        ((entity.attributes["supported_features"] as? Number)?.toInt() ?: 0) and
+                            SUPPORT_TARGET_TEMPERATURE == SUPPORT_TARGET_TEMPERATURE
                         ) ||
                         (
-                            (entity.attributes["supported_features"] as Int) and SUPPORT_TARGET_TEMPERATURE_RANGE ==
-                                SUPPORT_TARGET_TEMPERATURE_RANGE
+                            ((entity.attributes["supported_features"] as? Number)?.toInt() ?: 0) and
+                                SUPPORT_TARGET_TEMPERATURE_RANGE == SUPPORT_TARGET_TEMPERATURE_RANGE
                             )
                     )
         }
