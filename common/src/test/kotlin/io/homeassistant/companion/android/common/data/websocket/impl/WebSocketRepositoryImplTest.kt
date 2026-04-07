@@ -2,9 +2,15 @@ package io.homeassistant.companion.android.common.data.websocket.impl
 
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.websocket.WebSocketCore
+import io.homeassistant.companion.android.common.data.websocket.WebSocketState
 import io.homeassistant.companion.android.common.data.websocket.impl.WebSocketConstants.SUBSCRIBE_TYPE_ASSIST_PIPELINE_RUN
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.AreaRegistryResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AssistPipelineEvent
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.DeviceRegistryResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.EntityRegistryResponse
+import io.homeassistant.companion.android.common.data.websocket.impl.entities.RawMessageSocketResponse
 import io.homeassistant.companion.android.common.util.VOICE_SAMPLE_RATE
+import io.homeassistant.companion.android.common.util.kotlinJsonMapper
 import io.homeassistant.companion.android.database.server.Server
 import io.homeassistant.companion.android.database.server.ServerConnectionInfo
 import io.homeassistant.companion.android.database.server.ServerSessionInfo
@@ -13,11 +19,13 @@ import io.homeassistant.companion.android.testing.unit.ConsoleLogExtension
 import io.mockk.CapturingSlot
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.unmockkAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.encodeToString
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -235,14 +243,50 @@ class WebSocketRepositoryImplTest {
     @Nested
     inner class RegistryCache {
 
+        private fun fakeAreaResponse(): RawMessageSocketResponse {
+            val fakeResult = kotlinJsonMapper.parseToJsonElement(
+                kotlinJsonMapper.encodeToString(
+                    listOf(AreaRegistryResponse(areaId = "area1", name = "Living Room")),
+                ),
+            )
+            return mockk<RawMessageSocketResponse> {
+                every { success } returns true
+                every { result } returns fakeResult
+                every { error } returns null
+            }
+        }
+
+        private fun fakeDeviceResponse(): RawMessageSocketResponse {
+            val fakeResult = kotlinJsonMapper.parseToJsonElement(
+                kotlinJsonMapper.encodeToString(
+                    listOf(DeviceRegistryResponse(id = "device1", name = "Test Device")),
+                ),
+            )
+            return mockk<RawMessageSocketResponse> {
+                every { success } returns true
+                every { result } returns fakeResult
+                every { error } returns null
+            }
+        }
+
+        private fun fakeEntityResponse(): RawMessageSocketResponse {
+            val fakeResult = kotlinJsonMapper.parseToJsonElement(
+                kotlinJsonMapper.encodeToString(
+                    listOf(EntityRegistryResponse(entityId = "light.test")),
+                ),
+            )
+            return mockk<RawMessageSocketResponse> {
+                every { success } returns true
+                every { result } returns fakeResult
+                every { error } returns null
+            }
+        }
+
         @Test
         fun `Given area registry already cached when getAreaRegistry then does not call WebSocket`() = runTest {
-            // First call - populates cache
-            val fakeResponse = mockk<io.homeassistant.companion.android.common.data.websocket.impl.entities.RawMessageSocketResponse>(relaxed = true)
-            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) } returns fakeResponse
-            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
-            // mapResponse will return null for our mock, but getAreaRegistry will cache null and try again
-            // Instead, let's verify the caching behavior by calling twice and checking sendMessage count
+            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) } returns fakeAreaResponse()
+            coEvery { webSocketCore.getConnectionState() } returns WebSocketState.Active
+
             repository.getAreaRegistry()
             repository.getAreaRegistry()
 
@@ -252,14 +296,18 @@ class WebSocketRepositoryImplTest {
 
         @Test
         fun `Given WebSocket disconnected and cache exists when getAreaRegistry then returns cached data`() = runTest {
+            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) } returns fakeAreaResponse()
+            coEvery { webSocketCore.getConnectionState() } returns WebSocketState.Active
+
             // First call with active connection to populate cache
-            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
-            repository.getAreaRegistry()
+            val firstResult = repository.getAreaRegistry()
+            assertEquals(1, firstResult?.size)
 
             // Now simulate disconnection - cache should still be used even if stale
-            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.ClosedOther
+            coEvery { webSocketCore.getConnectionState() } returns WebSocketState.ClosedOther
 
-            repository.getAreaRegistry()
+            val secondResult = repository.getAreaRegistry()
+            assertEquals(1, secondResult?.size)
 
             // Still only 1 WebSocket call because cache is used when disconnected
             coVerify(exactly = 1) { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/area_registry/list" }) }
@@ -267,7 +315,9 @@ class WebSocketRepositoryImplTest {
 
         @Test
         fun `Given device registry already cached when getDeviceRegistry then does not call WebSocket`() = runTest {
-            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/device_registry/list" }) } returns fakeDeviceResponse()
+            coEvery { webSocketCore.getConnectionState() } returns WebSocketState.Active
+
             repository.getDeviceRegistry()
             repository.getDeviceRegistry()
 
@@ -276,7 +326,9 @@ class WebSocketRepositoryImplTest {
 
         @Test
         fun `Given entity registry already cached when getEntityRegistry then does not call WebSocket`() = runTest {
-            coEvery { webSocketCore.getConnectionState() } returns io.homeassistant.companion.android.common.data.websocket.WebSocketState.Active
+            coEvery { webSocketCore.sendMessage(match<Map<String, Any?>> { it["type"] == "config/entity_registry/list" }) } returns fakeEntityResponse()
+            coEvery { webSocketCore.getConnectionState() } returns WebSocketState.Active
+
             repository.getEntityRegistry()
             repository.getEntityRegistry()
 

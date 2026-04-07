@@ -16,6 +16,7 @@ import io.homeassistant.companion.android.common.data.integration.Entity
 import io.homeassistant.companion.android.common.data.integration.IntegrationRepository
 import io.homeassistant.companion.android.common.util.STATE_UNAVAILABLE
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -27,10 +28,10 @@ import timber.log.Timber
 object CameraControl : HaControl {
 
     /** In-memory cache of camera thumbnails by entity ID */
-    private val thumbnailCache = mutableMapOf<String, Bitmap>()
+    private val thumbnailCache = ConcurrentHashMap<String, Bitmap>()
 
     /** Timestamp of last fetch per entity ID */
-    private val lastFetchTime = mutableMapOf<String, Long>()
+    private val lastFetchTime = ConcurrentHashMap<String, Long>()
 
     /**
      * Pre-fetch a camera thumbnail in background. Called by WebsocketManager.
@@ -51,7 +52,11 @@ object CameraControl : HaControl {
         }
         lastFetchTime[entityId] = now
         try {
-            val bitmap = BitmapFactory.decodeStream(URL(baseUrl + entityPicture).openStream())
+            val connection = URL(baseUrl + entityPicture).openConnection().apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+            }
+            val bitmap = BitmapFactory.decodeStream(connection.getInputStream())
             if (bitmap != null) {
                 thumbnailCache[entityId] = bitmap
             }

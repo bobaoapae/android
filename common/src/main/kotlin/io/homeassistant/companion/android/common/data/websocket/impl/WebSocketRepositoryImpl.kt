@@ -55,7 +55,7 @@ import okhttp3.WebSocketListener
 
 private val matterTimeout = 2.minutes
 private val REGISTRY_CACHE_TTL = 5.minutes.inWholeMilliseconds
-private val SUBSCRIPTION_KEEPALIVE = kotlin.time.Duration.INFINITE
+private val SUBSCRIPTION_KEEPALIVE = 30.minutes
 
 class WebSocketRepositoryImpl internal constructor(
     private val webSocketCore: WebSocketCore,

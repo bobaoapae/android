@@ -20,6 +20,7 @@ import io.homeassistant.companion.android.common.data.websocket.impl.entities.De
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.EntityRegistryResponse
 import io.homeassistant.companion.android.util.RegistriesDataHandler
 import java.time.LocalDateTime
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Flow
 import java.util.function.Consumer
 import javax.inject.Inject
@@ -75,15 +76,15 @@ class HaControlsProviderService : ControlsProviderService() {
                     Build.VERSION.SDK_INT >= domainToMinimumApi[it]!!
             }
 
-        /** Cache of last known entity states, survives service recreation */
-        internal val cachedEntities = mutableMapOf<String, Entity>()
+        /** Cache of last known entity states, survives service recreation. Outer key: serverId, inner key: entityId */
+        internal val cachedEntities = ConcurrentHashMap<Int, ConcurrentHashMap<String, Entity>>()
 
         /** Last known control IDs per server, used by WebsocketManager to keep entities synced */
-        internal val lastControlEntityIds = mutableMapOf<Int, List<String>>()
+        internal val lastControlEntityIds = ConcurrentHashMap<Int, List<String>>()
 
         /** Last resolved base URL per server, used for instant cached control rendering */
         @Volatile
-        internal var lastBaseUrl = mutableMapOf<Int, String>()
+        internal var lastBaseUrl = ConcurrentHashMap<Int, String>()
     }
 
     @Inject
@@ -336,8 +337,9 @@ class HaControlsProviderService : ControlsProviderService() {
         // Cached controls were already sent synchronously in request().
         // Populate entities map from cache so live updates can apply diffs correctly.
         val entities = mutableMapOf<String, Entity>()
+        val serverCache = cachedEntities[serverId]
         entityIds.forEach { entityId ->
-            cachedEntities[entityId]?.let { entities[entityId] = it }
+            serverCache?.get(entityId)?.let { entities[entityId] = it }
         }
 
         if (serverManager.integrationRepository(serverId).isHomeAssistantVersionAtLeast(2022, 4, 0)) {
@@ -382,7 +384,7 @@ class HaControlsProviderService : ControlsProviderService() {
                         // Update static cache for instant display on next open
                         toSend.forEach { (key, entity) ->
                             if (!key.startsWith("ha_failed.")) {
-                                cachedEntities[entity.entityId] = entity
+                                cachedEntities.getOrPut(serverId) { ConcurrentHashMap() }[entity.entityId] = entity
                             }
                         }
                         // Always re-send ALL entities so Android doesn't mark unchanged ones as stale
@@ -582,8 +584,8 @@ class HaControlsProviderService : ControlsProviderService() {
     }
 
     /**
-     * Send cached controls synchronously in request() so Android never shows "loading".
-     * No suspend, no coroutine dispatch — runs directly on the calling thread.
+     * Force-refresh camera thumbnails for the given control IDs and re-send the updated controls
+     * to the subscriber with fresh images.
      */
     @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun refreshCameraThumbnails(
@@ -592,10 +594,11 @@ class HaControlsProviderService : ControlsProviderService() {
     ) {
         controlIds.forEach { controlId ->
             try {
-                val serverId = controlId.split(".")[0].toIntOrNull() ?: return@forEach
+                val serverId = controlId.split(".")[0].toIntOrNull()
+                    ?: lastControlEntityIds.keys.firstOrNull() ?: return@forEach
                 val entityId = controlId.removePrefix("$serverId.")
                 if (!entityId.startsWith("camera.")) return@forEach
-                val entity = cachedEntities[entityId] ?: return@forEach
+                val entity = cachedEntities[serverId]?.get(entityId) ?: return@forEach
                 val baseUrl = lastBaseUrl[serverId] ?: return@forEach
                 val entityPicture = entity.attributes["entity_picture"] as? String ?: return@forEach
 
@@ -627,9 +630,10 @@ class HaControlsProviderService : ControlsProviderService() {
         if (cachedEntities.isEmpty()) return
         controlIds.forEach { controlId ->
             try {
-                val serverId = controlId.split(".")[0].toIntOrNull() ?: return@forEach
+                val serverId = controlId.split(".")[0].toIntOrNull()
+                    ?: lastControlEntityIds.keys.firstOrNull() ?: return@forEach
                 val entityId = controlId.removePrefix("$serverId.")
-                val entity = cachedEntities[entityId] ?: return@forEach
+                val entity = cachedEntities[serverId]?.get(entityId) ?: return@forEach
                 val domain = entityId.split(".")[0]
                 val haControl = domainToHaControl[domain] ?: return@forEach
                 val info = HaControlInfo(

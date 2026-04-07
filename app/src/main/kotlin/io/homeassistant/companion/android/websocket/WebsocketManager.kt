@@ -219,6 +219,8 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
                 e.await()
             }
             Timber.d("Prefetched registries for server $serverId")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Timber.e(e, "Failed to prefetch registries for server $serverId")
         }
@@ -232,7 +234,8 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
             false
         }
 
-        HaControlsProviderService.cachedEntities.values
+        val serverEntities = HaControlsProviderService.cachedEntities[serverId] ?: return
+        serverEntities.values
             .filter { it.domain == "camera" }
             .forEach { entity ->
                 val entityPicture = entity.attributes["entity_picture"] as? String
@@ -259,8 +262,11 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
             val entities = mutableMapOf<String, io.homeassistant.companion.android.common.data.integration.Entity>()
 
             // Populate from existing cache
+            val serverCache = HaControlsProviderService.cachedEntities.getOrPut(serverId) {
+                java.util.concurrent.ConcurrentHashMap()
+            }
             entityIds.forEach { id ->
-                HaControlsProviderService.cachedEntities[id]?.let { entities[id] = it }
+                serverCache[id]?.let { entities[id] = it }
             }
 
             serverManager.webSocketRepository(serverId).getCompressedStateAndChanges(entityIds)
@@ -268,18 +274,18 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
                     event.added?.forEach {
                         val entity = it.value.toEntity(it.key)
                         entities[it.key] = entity
-                        HaControlsProviderService.cachedEntities[it.key] = entity
+                        serverCache[it.key] = entity
                     }
                     event.changed?.forEach {
                         val entity = entities[it.key]?.applyCompressedStateDiff(it.value)
                         entity?.let { updated ->
                             entities[it.key] = updated
-                            HaControlsProviderService.cachedEntities[it.key] = updated
+                            serverCache[it.key] = updated
                         }
                     }
                     event.removed?.forEach {
                         entities.remove(it)
-                        HaControlsProviderService.cachedEntities.remove(it)
+                        serverCache.remove(it)
                     }
                 }
         } catch (e: CancellationException) {
