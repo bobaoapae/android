@@ -24,6 +24,7 @@ val threadPolicyIgnoredViolationRules = listOf(
     IgnoreAndroidAutoRendererServiceDiskRead,
     IgnoreMiuiFontSettingsDiskRead,
     IgnoreMiuiTurboSchedMonitorDiskRead,
+    IgnoreOplusBinderProxyDiskRead,
 )
 
 /**
@@ -224,6 +225,23 @@ private data object IgnoreMiuiTurboSchedMonitorDiskRead : IgnoreViolationRule {
 
         return violation.stackTrace.any {
             it.className == "android.os.TurboSchedMonitorImpl"
+        }
+    }
+}
+
+/**
+ * Ignore a [DiskReadViolation] in Oppo/OnePlus's BinderProxy and HANS components.
+ * This occurs when the OEM's process management checks file existence during
+ * accessibility service binder transactions and is beyond application control.
+ */
+private data object IgnoreOplusBinderProxyDiskRead : IgnoreViolationRule {
+    @RequiresApi(Build.VERSION_CODES.P)
+    override fun shouldIgnore(violation: Violation): Boolean {
+        if (violation !is DiskReadViolation) return false
+
+        return violation.stackTrace.any {
+            it.className.startsWith("com.android.server.hans.") ||
+                it.className.startsWith("com.android.server.am.OplusHansManager")
         }
     }
 }
