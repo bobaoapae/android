@@ -24,7 +24,7 @@ val threadPolicyIgnoredViolationRules = listOf(
     IgnoreAndroidAutoRendererServiceDiskRead,
     IgnoreMiuiFontSettingsDiskRead,
     IgnoreMiuiTurboSchedMonitorDiskRead,
-    IgnoreOplusBinderProxyDiskRead,
+    IgnoreSystemDiskIo,
 )
 
 /**
@@ -230,18 +230,19 @@ private data object IgnoreMiuiTurboSchedMonitorDiskRead : IgnoreViolationRule {
 }
 
 /**
- * Ignore a [DiskReadViolation] in Oppo/OnePlus's BinderProxy and HANS components.
- * This occurs when the OEM's process management checks file existence during
- * accessibility service binder transactions and is beyond application control.
+ * Ignore [DiskReadViolation] and [DiskWriteViolation] that originate entirely from
+ * OEM or system code (no app frames in the stack trace). This covers Oppo/OnePlus
+ * (OplusUIFirstManager, OplusHansManager, OplusBinderProxy), Samsung, MIUI, and other
+ * OEM components that perform disk I/O during binder transactions which are beyond
+ * application control.
  */
-private data object IgnoreOplusBinderProxyDiskRead : IgnoreViolationRule {
+private data object IgnoreSystemDiskIo : IgnoreViolationRule {
+    private const val APP_PACKAGE = "io.homeassistant.companion.android"
+
     @RequiresApi(Build.VERSION_CODES.P)
     override fun shouldIgnore(violation: Violation): Boolean {
-        if (violation !is DiskReadViolation) return false
+        if (violation !is DiskReadViolation && violation !is DiskWriteViolation) return false
 
-        return violation.stackTrace.any {
-            it.className.startsWith("com.android.server.hans.") ||
-                it.className.startsWith("com.android.server.am.OplusHansManager")
-        }
+        return violation.stackTrace.none { it.className.startsWith(APP_PACKAGE) }
     }
 }
