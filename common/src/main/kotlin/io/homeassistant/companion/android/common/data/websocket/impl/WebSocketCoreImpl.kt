@@ -66,16 +66,20 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -656,7 +660,9 @@ internal class WebSocketCoreImpl(
 
     @OptIn(DelicateCoroutinesApi::class)
     override fun onMessage(webSocket: WebSocket, text: String) {
-        Timber.d("Websocket: onMessage (text: ${sensitive(text)})")
+        // Logging huge payloads (registries can be megabytes) blocks this thread for tens of seconds
+        // because logcat splits the message into thousands of small chunks. Truncate aggressively.
+        Timber.d("Websocket: onMessage (size=${text.length} preview=${sensitive(text.take(200))})")
         if (isStaleConnection(webSocket)) {
             Timber.w("Ignoring onMessage from stale connection")
             return
@@ -745,18 +751,67 @@ internal class WebSocketCoreImpl(
 
     private suspend fun <T> createSubscriptionFlow(subscribeMessage: Map<String, Any?>, timeout: Duration): Flow<T>? {
         val channel = Channel<T>(capacity = Channel.BUFFERED)
-        val flow = callbackFlow<T> {
-            launch { channel.consumeAsFlow().collect(::send) }
-            awaitClose {
+
+        // Use an explicit MutableSharedFlow with replay=1 so a late subscriber (caller that
+        // collects after the initial state event has already arrived) still receives it.
+        //
+        // The previous implementation used `callbackFlow { ... }.shareIn(WhileSubscribed, replay=0)`
+        // which had a race: between sendMessage returning (success ack) and the caller calling
+        // .collect, the initial state event could arrive and land in the channel; but since the
+        // upstream callbackFlow only starts on first subscriber, and replay=0, the event was
+        // silently lost by the time the caller finally subscribed.
+        val mutableFlow = MutableSharedFlow<T>(
+            replay = 1,
+            extraBufferCapacity = 64,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+        val sharedFlow = mutableFlow.asSharedFlow()
+
+        // Start relaying channel -> sharedFlow IMMEDIATELY, before sendMessage. This way any
+        // event that arrives between the subscribe ack and the caller's collect is buffered in
+        // the SharedFlow's replay cache and delivered when the caller finally subscribes.
+        val relayJob = backgroundScope.launch {
+            try {
+                for (item in channel) {
+                    mutableFlow.emit(item)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Timber.e(e, "Relay job failed for $subscribeMessage")
+            }
+        }
+
+        val response = sendMessage(
+            Command.WithAnswer.Subscription(
+                request = WebSocketRequest(message = subscribeMessage),
+                eventFlow = sharedFlow as SharedFlow<Any>,
+                onEvent = channel as Channel<Any>,
+            ),
+        )
+        if (response == null || response.success != true) {
+            Timber.e("Unable to subscribe to $subscribeMessage")
+            relayJob.cancel()
+            channel.close()
+            findSubscription(subscribeMessage)?.let { activeMessages.remove(it.key) }
+            return null
+        }
+
+        // Clean up (unsubscribe on server, cancel relay, close channel) when the last subscriber
+        // goes away. onCompletion fires per-subscriber; we check subscriptionCount after our own
+        // cancellation to detect "last one out".
+        return sharedFlow.onCompletion {
+            if (mutableFlow.subscriptionCount.value == 0) {
                 wsScope.launch {
                     eventSubscriptionMutex.withLock {
                         findSubscription(subscribeMessage)
                             ?.let {
                                 val subscription = it.key
                                 Timber.d("Unsubscribing from $subscribeMessage")
-                                // Unsubscribe must happen before removing from activeMessages to ensure
-                                // the server acknowledges before we stop handling events for this subscription
+                                // Server unsubscribe must precede activeMessages removal so the
+                                // server's ack is still routed correctly while events drain.
                                 unsubscribeEvents(subscription)
+                                relayJob.cancel()
                                 channel.close()
                                 activeMessages.remove(subscription)
                             }
@@ -769,21 +824,6 @@ internal class WebSocketCoreImpl(
                     }
                 }
             }
-        }.shareIn(backgroundScope, SharingStarted.WhileSubscribed(timeout.inWholeMilliseconds, 0))
-
-        val response = sendMessage(
-            Command.WithAnswer.Subscription(
-                request = WebSocketRequest(message = subscribeMessage),
-                eventFlow = flow as SharedFlow<Any>,
-                onEvent = channel as Channel<Any>,
-            ),
-        )
-        if (response == null || response.success != true) {
-            Timber.e("Unable to subscribe to $subscribeMessage")
-            findSubscription(subscribeMessage)?.let { activeMessages.remove(it.key) }
-            return null
-        } else {
-            return flow
         }
     }
 

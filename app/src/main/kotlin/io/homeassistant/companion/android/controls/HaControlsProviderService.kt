@@ -26,6 +26,7 @@ import java.util.function.Consumer
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
@@ -93,7 +94,7 @@ class HaControlsProviderService : ControlsProviderService() {
     @Inject
     lateinit var prefsRepository: PrefsRepository
 
-    private val ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+    private val ioScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var areaRegistry = mutableMapOf<Int, List<AreaRegistryResponse>?>()
     private var deviceRegistry = mutableMapOf<Int, List<DeviceRegistryResponse>?>()
@@ -197,7 +198,7 @@ class HaControlsProviderService : ControlsProviderService() {
         Timber.d("publisherFor $controlIds")
         return Flow.Publisher { subscriber ->
             subscriber.onSubscribe(object : Flow.Subscription {
-                val webSocketScope = CoroutineScope(Dispatchers.IO)
+                val webSocketScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
                 override fun request(n: Long) {
                     // Send cached controls IMMEDIATELY (synchronous, no coroutine dispatch)
                     sendCachedControlsImmediately(controlIds, subscriber)
@@ -209,21 +210,30 @@ class HaControlsProviderService : ControlsProviderService() {
 
                     // Then launch async work for live updates
                     ioScope.launch {
-                        if (!serverManager.isRegistered()) return@launch else Timber.d("request $n")
-
-                        controlIds
-                            .groupBy {
-                                it.split(".")[0].toIntOrNull()
-                                    ?: serverManager.servers().firstOrNull()?.id
-                            }.forEach { (serverId, serverControlIds) ->
-                                if (serverId == null) return@forEach
-                                subscribeToEntitiesForServer(
-                                    serverId,
-                                    serverControlIds,
-                                    webSocketScope,
-                                    subscriber,
-                                )
+                        try {
+                            if (!serverManager.isRegistered()) {
+                                Timber.w("request $n: not registered, aborting")
+                                return@launch
                             }
+
+                            // Resolve fallback serverId once instead of inside the groupBy lambda,
+                            // which would otherwise hit Room O(controlIds) times per panel open.
+                            val fallbackServerId = serverManager.servers().firstOrNull()?.id
+                            controlIds
+                                .groupBy {
+                                    it.split(".")[0].toIntOrNull() ?: fallbackServerId
+                                }.forEach { (serverId, serverControlIds) ->
+                                    if (serverId == null) return@forEach
+                                    subscribeToEntitiesForServer(
+                                        serverId,
+                                        serverControlIds,
+                                        webSocketScope,
+                                        subscriber,
+                                    )
+                                }
+                        } catch (e: Exception) {
+                            Timber.e(e, "Failed to set up live device controls")
+                        }
                     }
                 }
 
@@ -345,17 +355,24 @@ class HaControlsProviderService : ControlsProviderService() {
             serverCache?.get(entityId)?.let { entities[entityId] = it }
         }
 
-        if (serverManager.integrationRepository(serverId).isHomeAssistantVersionAtLeast(2022, 4, 0)) {
+        val versionOk = try {
+            serverManager.integrationRepository(serverId).isHomeAssistantVersionAtLeast(2022, 4, 0)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to check HA version, falling back to legacy path")
+            false
+        }
+        if (versionOk) {
             webSocketScope.launch {
                 var sentInitial = false
                 val error404 = HttpException(Response.error<ResponseBody>(404, byteArrayOf().toResponseBody()))
 
-                serverManager.webSocketRepository(serverId).getCompressedStateAndChanges(entityIds)
-                    ?.collect { event ->
+                try {
+                    val flow = serverManager.webSocketRepository(serverId).getCompressedStateAndChanges(entityIds)
+                    flow?.collect { event ->
                         val toSend = mutableMapOf<String, Entity>()
                         event.added?.forEach {
                             val entity = it.value.toEntity(it.key)
-                            entities.remove("ha_failed.$it")
+                            entities.remove("ha_failed.${it.key}")
                             entities[it.key] = entity
                             toSend[it.key] = entity
                         }
@@ -402,24 +419,27 @@ class HaControlsProviderService : ControlsProviderService() {
                             baseUrl,
                         )
                     } ?: run {
-                    entityIds.forEachIndexed { index, entityId ->
-                        val entity = getFailedEntity(entityId, Exception())
-                        entities["ha_failed.$entityId"] = entity
-                        domainToHaControl["ha_failed"]?.createControl(
-                            applicationContext,
-                            entity,
-                            HaControlInfo(
-                                systemId = controlIds[index],
-                                entityId = entity.entityId,
-                                serverId = serverId,
-                                area = getAreaForEntity(entity.entityId, serverId),
-                                authRequired = entityRequiresAuth(entity.entityId, serverId),
-                                baseUrl = baseUrl,
-                                serverName = serverName,
-                                splitMultiServerIntoStructure = splitMultiServersIntoStructures,
-                            ),
-                        )?.let { control -> subscriber.onNext(control) }
+                        entityIds.forEachIndexed { index, entityId ->
+                            val entity = getFailedEntity(entityId, Exception())
+                            entities["ha_failed.$entityId"] = entity
+                            domainToHaControl["ha_failed"]?.createControl(
+                                applicationContext,
+                                entity,
+                                HaControlInfo(
+                                    systemId = controlIds[index],
+                                    entityId = entity.entityId,
+                                    serverId = serverId,
+                                    area = getAreaForEntity(entity.entityId, serverId),
+                                    authRequired = entityRequiresAuth(entity.entityId, serverId),
+                                    baseUrl = baseUrl,
+                                    serverName = serverName,
+                                    splitMultiServerIntoStructure = splitMultiServersIntoStructures,
+                                ),
+                            )?.let { control -> subscriber.onNext(control) }
+                        }
                     }
+                } catch (e: Exception) {
+                    Timber.e(e, "Exception in compressed state collect")
                 }
             }
         } else {
@@ -630,34 +650,53 @@ class HaControlsProviderService : ControlsProviderService() {
         controlIds: MutableList<String>,
         subscriber: Flow.Subscriber<in Control>,
     ) {
-        if (cachedEntities.isEmpty()) {
-            Timber.d("sendCachedControlsImmediately: cache empty, skipping")
-            return
-        }
-        var sent = 0
+        // Runs on the main thread (RequestHandler.handleMessage), so MUST NOT do any disk I/O —
+        // the project's StrictMode + CrashFailFastHandler will kill the process on a violation.
+        var sentCached = 0
+        var sentPlaceholder = 0
         controlIds.forEach { controlId ->
             try {
                 val serverId = controlId.split(".")[0].toIntOrNull()
                     ?: lastControlEntityIds.keys.firstOrNull() ?: return@forEach
                 val entityId = controlId.removePrefix("$serverId.")
-                val entity = cachedEntities[serverId]?.get(entityId) ?: return@forEach
-                val domain = entityId.split(".")[0]
-                val haControl = domainToHaControl[domain] ?: return@forEach
-                val info = HaControlInfo(
-                    systemId = controlId,
-                    entityId = entityId,
-                    serverId = serverId,
-                    area = getAreaForEntity(entityId, serverId),
-                    baseUrl = lastBaseUrl[serverId],
-                )
-                val control = haControl.createControl(applicationContext, entity, info)
-                subscriber.onNext(control)
-                sent++
+                val entity = cachedEntities[serverId]?.get(entityId)
+
+                if (entity != null) {
+                    val domain = entityId.split(".")[0]
+                    val haControl = domainToHaControl[domain] ?: return@forEach
+                    val info = HaControlInfo(
+                        systemId = controlId,
+                        entityId = entityId,
+                        serverId = serverId,
+                        area = getAreaForEntity(entityId, serverId),
+                        baseUrl = lastBaseUrl[serverId],
+                    )
+                    val control = haControl.createControl(applicationContext, entity, info)
+                    subscriber.onNext(control)
+                    sentCached++
+                } else {
+                    // No cached entity (e.g. after force-stop) - send placeholder to prevent
+                    // infinite loading spinner. The async path will replace it with real data.
+                    val placeholderEntity = getFailedEntity(entityId, Exception())
+                        .copy(state = "loading")
+                    domainToHaControl["ha_failed"]?.createControl(
+                        applicationContext,
+                        placeholderEntity,
+                        HaControlInfo(
+                            systemId = controlId,
+                            entityId = entityId,
+                            serverId = serverId,
+                        ),
+                    )?.let { control ->
+                        subscriber.onNext(control)
+                        sentPlaceholder++
+                    }
+                }
             } catch (e: Exception) {
-                Timber.e(e, "Failed to send cached control for $controlId")
+                Timber.e(e, "Failed to send control for $controlId")
             }
         }
-        Timber.d("Sent $sent/${controlIds.size} cached controls immediately")
+        Timber.d("Sent $sentCached cached + $sentPlaceholder placeholder controls immediately")
     }
 
     private fun getFailedEntity(entityId: String, exception: Exception): Entity {

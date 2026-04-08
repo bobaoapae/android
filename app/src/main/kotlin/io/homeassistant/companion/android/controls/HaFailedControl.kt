@@ -20,7 +20,13 @@ object HaFailedControl : HaControl {
         entity: Entity,
         info: HaControlInfo,
     ): Control.StatefulBuilder {
-        control.setStatus(if (entity.state == "notfound") Control.STATUS_NOT_FOUND else Control.STATUS_ERROR)
+        control.setStatus(
+            when (entity.state) {
+                "notfound" -> Control.STATUS_NOT_FOUND
+                "loading" -> Control.STATUS_UNKNOWN
+                else -> Control.STATUS_ERROR
+            },
+        )
         control.setStatusText("")
         control.setControlTemplate(
             StatelessTemplate(
