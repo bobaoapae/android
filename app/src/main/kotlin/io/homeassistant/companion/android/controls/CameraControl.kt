@@ -17,11 +17,6 @@ import io.homeassistant.companion.android.common.data.integration.IntegrationRep
 import io.homeassistant.companion.android.common.util.STATE_UNAVAILABLE
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 
 @RequiresApi(Build.VERSION_CODES.S)
@@ -71,16 +66,11 @@ object CameraControl : HaControl {
         entity: Entity,
         info: HaControlInfo,
     ): Control.StatefulBuilder {
-        val entityPicture = entity.attributes["entity_picture"] as? String
-        // Use cached thumbnail (always available after first prefetch)
-        var image = thumbnailCache[entity.entityId]
-        // If no cache and baseUrl available, try to fetch synchronously (first time only)
-        if (image == null && info.baseUrl != null && entityPicture?.isNotBlank() == true) {
-            image = getThumbnail(info.baseUrl + entityPicture)
-            if (image != null) {
-                thumbnailCache[entity.entityId] = image
-            }
-        }
+        // Only use cached thumbnails here. provideControlFeatures can run on the main thread
+        // (via sendCachedControlsImmediately) and any blocking network call would trip StrictMode.
+        // Thumbnails are populated asynchronously by prefetchThumbnail (background sync via
+        // WebsocketManager, and on-demand via HaControlsProviderService.refreshCameraThumbnails).
+        val image = thumbnailCache[entity.entityId]
         val icon = if (image != null) {
             Icon.createWithBitmap(image)
         } else {
@@ -105,19 +95,5 @@ object CameraControl : HaControl {
     override suspend fun performAction(integrationRepository: IntegrationRepository, action: ControlAction): Boolean {
         // No action is received, Android immediately invokes long press
         return true
-    }
-
-    private fun getThumbnail(path: String): Bitmap? = runBlocking {
-        var image: Bitmap? = null
-        withTimeoutOrNull(TimeUnit.SECONDS.toMillis(2)) {
-            withContext(Dispatchers.IO) {
-                try {
-                    image = BitmapFactory.decodeStream(URL(path).openStream())
-                } catch (e: Exception) {
-                    Timber.e(e, "Couldn't download image for control")
-                }
-            }
-        }
-        return@runBlocking image
     }
 }
