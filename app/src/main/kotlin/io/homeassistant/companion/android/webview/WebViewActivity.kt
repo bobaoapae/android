@@ -16,13 +16,10 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.text.method.HideReturnsTransformationMethod
 import android.text.method.PasswordTransformationMethod
 import android.util.DisplayMetrics
 import android.util.Rational
-import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -122,6 +119,8 @@ import io.homeassistant.companion.android.database.authentication.Authentication
 import io.homeassistant.companion.android.database.authentication.AuthenticationDao
 import io.homeassistant.companion.android.database.server.ServerConnectionInfo
 import io.homeassistant.companion.android.databinding.DialogAuthenticationBinding
+import io.homeassistant.companion.android.frontend.externalbus.incoming.HapticType
+import io.homeassistant.companion.android.frontend.haptic.HapticFeedbackPerformer
 import io.homeassistant.companion.android.improv.ui.ImprovPermissionDialog
 import io.homeassistant.companion.android.improv.ui.ImprovSetupDialog
 import io.homeassistant.companion.android.launch.LaunchActivity
@@ -1367,58 +1366,20 @@ class WebViewActivity :
     }
 
     fun processHaptic(hapticType: String) {
-        val vm = getSystemService<Vibrator>()
-
         Timber.d("Processing haptic tag for $hapticType")
-        when (hapticType) {
-            "success" -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    webView.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                } else {
-                    @Suppress("DEPRECATION")
-                    vm?.vibrate(500)
-                }
-            }
-
-            "warning" -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    vm?.vibrate(VibrationEffect.createOneShot(400, VibrationEffect.EFFECT_HEAVY_CLICK))
-                } else {
-                    @Suppress("DEPRECATION")
-                    vm?.vibrate(1500)
-                }
-            }
-
-            "failure" -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    webView.performHapticFeedback(HapticFeedbackConstants.REJECT)
-                } else {
-                    @Suppress("DEPRECATION")
-                    vm?.vibrate(1000)
-                }
-            }
-
-            "light" -> {
-                webView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            }
-
-            "medium" -> {
-                webView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-            }
-
-            "heavy" -> {
-                webView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-            }
-
-            "selection" -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    webView.performHapticFeedback(HapticFeedbackConstants.GESTURE_START)
-                } else {
-                    @Suppress("DEPRECATION")
-                    vm?.vibrate(50)
-                }
-            }
-        }
+        HapticFeedbackPerformer.perform(
+            webView,
+            when (hapticType) {
+                "success" -> HapticType.Success
+                "warning" -> HapticType.Warning
+                "failure" -> HapticType.Failure
+                "light" -> HapticType.Light
+                "medium" -> HapticType.Medium
+                "heavy" -> HapticType.Heavy
+                "selection" -> HapticType.Selection
+                else -> HapticType.Unknown
+            },
+        )
     }
 
     private fun authenticationResult(result: Int) {

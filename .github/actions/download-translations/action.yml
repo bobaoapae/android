@@ -27,6 +27,14 @@ runs:
           replace_breaks: true
           export_empty_as: skip
 
+    # Source strings (English) are managed in git, not Lokalise.
+    # Restore the file in case Lokalise overwrote it.
+    - name: Revert source strings to git version
+      shell: bash
+      run: |
+        git checkout common/src/main/res/values/strings.xml
+        git status
+
     - name: Generate locales_config.xml
       shell: bash
       run: |
