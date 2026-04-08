@@ -52,6 +52,10 @@ interface PrefsRepository {
 
     suspend fun setControlsAuthEntities(entities: List<String>)
 
+    suspend fun getControlsEntityIds(serverId: Int): List<String>
+
+    suspend fun setControlsEntityIds(serverId: Int, entityIds: List<String>)
+
     suspend fun getControlsPanelServer(): Int?
 
     suspend fun setControlsPanelServer(serverId: Int)

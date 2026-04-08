@@ -42,7 +42,8 @@ private data object IgnoreChromiumTrichomeWrongContextUsage : IgnoreViolationRul
         if (violation !is IncorrectContextUseViolation) return false
 
         return violation.stackTrace.any {
-            it.fileName?.startsWith("chromium-TrichromeWebViewGoogle") == true &&
+            (it.fileName?.startsWith("chromium-TrichromeWebViewGoogle") == true ||
+                it.fileName?.startsWith("chromium-SystemWebViewGoogle") == true) &&
                 it.methodName == "onConfigurationChanged"
         }
     }

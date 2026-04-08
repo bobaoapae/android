@@ -327,6 +327,9 @@ class HaControlsProviderService : ControlsProviderService() {
         }
         // Save entity IDs so WebsocketManager can keep them synced in background
         lastControlEntityIds[serverId] = entityIds
+        ioScope.launch {
+            prefsRepository.setControlsEntityIds(serverId, entityIds)
+        }
 
         areaRegistry[serverId] = getAreaRegistry.await()
         deviceRegistry[serverId] = getDeviceRegistry.await()
@@ -627,7 +630,11 @@ class HaControlsProviderService : ControlsProviderService() {
         controlIds: MutableList<String>,
         subscriber: Flow.Subscriber<in Control>,
     ) {
-        if (cachedEntities.isEmpty()) return
+        if (cachedEntities.isEmpty()) {
+            Timber.d("sendCachedControlsImmediately: cache empty, skipping")
+            return
+        }
+        var sent = 0
         controlIds.forEach { controlId ->
             try {
                 val serverId = controlId.split(".")[0].toIntOrNull()
@@ -645,11 +652,12 @@ class HaControlsProviderService : ControlsProviderService() {
                 )
                 val control = haControl.createControl(applicationContext, entity, info)
                 subscriber.onNext(control)
+                sent++
             } catch (e: Exception) {
                 Timber.e(e, "Failed to send cached control for $controlId")
             }
         }
-        Timber.d("Sent ${controlIds.size} cached controls immediately")
+        Timber.d("Sent $sent/${controlIds.size} cached controls immediately")
     }
 
     private fun getFailedEntity(entityId: String, exception: Exception): Entity {

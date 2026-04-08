@@ -26,6 +26,7 @@ import dagger.hilt.components.SingletonComponent
 import io.homeassistant.companion.android.BuildConfig
 import io.homeassistant.companion.android.common.R
 import io.homeassistant.companion.android.common.data.integration.applyCompressedStateDiff
+import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.util.CHANNEL_WEBSOCKET
 import io.homeassistant.companion.android.common.util.CHANNEL_WEBSOCKET_ISSUES
@@ -105,6 +106,7 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
     private val serverManager: ServerManager = entryPoint.serverManager()
     private val messagingManager: MessagingManager = entryPoint.messagingManager()
     private val settingsDao: SettingsDao = entryPoint.settingsDao()
+    private val prefsRepository: PrefsRepository = entryPoint.prefsRepository()
     private val entitySyncJobs = mutableMapOf<Int, Job>()
 
     @EntryPoint
@@ -113,6 +115,7 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
         fun serverManager(): ServerManager
         fun messagingManager(): MessagingManager
         fun settingsDao(): SettingsDao
+        fun prefsRepository(): PrefsRepository
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -193,9 +196,18 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
 
         // Keep control entities synced in background
         servers.forEach { server ->
-            val entityIds = HaControlsProviderService.lastControlEntityIds[server.id]
+            var entityIds = HaControlsProviderService.lastControlEntityIds[server.id]
+            // Restore from persisted prefs if memory cache is empty (process was restarted)
+            if (entityIds.isNullOrEmpty()) {
+                entityIds = prefsRepository.getControlsEntityIds(server.id)
+                if (entityIds.isNotEmpty()) {
+                    HaControlsProviderService.lastControlEntityIds[server.id] = entityIds
+                }
+            }
             if (!entityIds.isNullOrEmpty() && server.id !in entitySyncJobs) {
-                entitySyncJobs[server.id] = coroutineScope.launch { syncControlEntities(server.id, entityIds) }
+                entitySyncJobs[server.id] = coroutineScope.launch {
+                    syncControlEntities(server.id, entityIds)
+                }
             }
         }
         // Clean up finished sync jobs
@@ -227,14 +239,29 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
     }
 
     private suspend fun prefetchCameraThumbnails(serverId: Int) {
-        val baseUrl = HaControlsProviderService.lastBaseUrl[serverId] ?: return
+        val serverEntities = HaControlsProviderService.cachedEntities[serverId] ?: return
+        if (serverEntities.values.none { it.domain == "camera" }) return
+
+        // Resolve baseUrl if not cached (e.g. after process restart)
+        var baseUrl = HaControlsProviderService.lastBaseUrl[serverId]
+        if (baseUrl == null) {
+            baseUrl = try {
+                serverManager.connectionStateProvider(serverId).getExternalUrl()
+                    ?.toString()?.removeSuffix("/")
+            } catch (e: Exception) {
+                null
+            }
+            if (baseUrl != null) {
+                HaControlsProviderService.lastBaseUrl[serverId] = baseUrl
+            } else {
+                return
+            }
+        }
         val isInternal = try {
             serverManager.connectionStateProvider(serverId).isInternal(requiresUrl = false)
         } catch (e: Exception) {
             false
         }
-
-        val serverEntities = HaControlsProviderService.cachedEntities[serverId] ?: return
         serverEntities.values
             .filter { it.domain == "camera" }
             .forEach { entity ->
