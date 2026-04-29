@@ -296,7 +296,14 @@ class WebsocketManager(appContext: Context, workerParams: WorkerParameters) :
                 serverCache[id]?.let { entities[id] = it }
             }
 
-            serverManager.webSocketRepository(serverId).getCompressedStateAndChanges(entityIds)
+            // Resolve and cache the repository so HaControlsProviderService can synchronously
+            // check the WebSocket connection state on the main thread in
+            // sendCachedControlsImmediately. Priming this from background sync means the first
+            // panel open after process restart already has the connection state available.
+            val webSocketRepository = serverManager.webSocketRepository(serverId)
+            HaControlsProviderService.webSocketRepositoryCache[serverId] = webSocketRepository
+
+            webSocketRepository.getCompressedStateAndChanges(entityIds)
                 ?.collect { event ->
                     event.added?.forEach {
                         val entity = it.value.toEntity(it.key)

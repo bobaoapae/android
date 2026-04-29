@@ -12,9 +12,12 @@ import io.homeassistant.companion.android.common.data.integration.IntegrationDom
 import io.homeassistant.companion.android.common.data.integration.IntegrationDomains.CLIMATE_DOMAIN
 import io.homeassistant.companion.android.common.data.integration.IntegrationDomains.MEDIA_PLAYER_DOMAIN
 import io.homeassistant.companion.android.common.data.integration.applyCompressedStateDiff
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.servers.firstUrlOrNull
+import io.homeassistant.companion.android.common.data.websocket.WebSocketRepository
+import io.homeassistant.companion.android.common.data.websocket.WebSocketState
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AreaRegistryResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.DeviceRegistryResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.EntityRegistryResponse
@@ -86,6 +89,17 @@ class HaControlsProviderService : ControlsProviderService() {
         /** Last resolved base URL per server, used for instant cached control rendering */
         @Volatile
         internal var lastBaseUrl = ConcurrentHashMap<Int, String>()
+
+        /**
+         * Cached [WebSocketRepository] per server so the main thread can synchronously read the
+         * current [WebSocketState] in `sendCachedControlsImmediately` to decide whether the
+         * cached entity states are still trustworthy. Populated from suspend contexts that
+         * already hold a repository reference (`subscribeToEntitiesForServer` and
+         * `WebsocketManager.syncControlEntities`). The repository is a stable per-server
+         * singleton retained by `ServerManager`, so reading `getConnectionState()` on it from
+         * any thread is safe.
+         */
+        internal val webSocketRepositoryCache = ConcurrentHashMap<Int, WebSocketRepository>()
     }
 
     @Inject
@@ -93,6 +107,9 @@ class HaControlsProviderService : ControlsProviderService() {
 
     @Inject
     lateinit var prefsRepository: PrefsRepository
+
+    @Inject
+    lateinit var networkHelper: NetworkHelper
 
     private val ioScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -320,10 +337,17 @@ class HaControlsProviderService : ControlsProviderService() {
             return
         }
 
+        // Resolve the repository once and cache it so the main thread can synchronously read
+        // WebSocketState in `sendCachedControlsImmediately` later. Reusing the same reference
+        // across the three registry fetches also avoids three extra Mutex acquisitions on
+        // ServerMap.getOrCreate inside ServerManager.
+        val webSocketRepository = serverManager.webSocketRepository(serverId)
+        webSocketRepositoryCache[serverId] = webSocketRepository
+
         // Resolve all initial data in parallel (registries are cached, baseUrl is fast)
-        val getAreaRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getAreaRegistry() }
-        val getDeviceRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getDeviceRegistry() }
-        val getEntityRegistry = ioScope.async { serverManager.webSocketRepository(serverId).getEntityRegistry() }
+        val getAreaRegistry = ioScope.async { webSocketRepository.getAreaRegistry() }
+        val getDeviceRegistry = ioScope.async { webSocketRepository.getDeviceRegistry() }
+        val getEntityRegistry = ioScope.async { webSocketRepository.getEntityRegistry() }
         val getBaseUrl = ioScope.async {
             serverManager.connectionStateProvider(serverId).urlFlow().firstUrlOrNull()?.toString()?.removeSuffix("/")
                 ?: ""
@@ -652,6 +676,15 @@ class HaControlsProviderService : ControlsProviderService() {
     ) {
         // Runs on the main thread (RequestHandler.handleMessage), so MUST NOT do any disk I/O —
         // the project's StrictMode + CrashFailFastHandler will kill the process on a violation.
+        // The cached entity state is only trustworthy while the WebSocket is currently Active
+        // AND Android reports that the device has network. Checking just WebSocketState is not
+        // enough: OkHttp only transitions the state to Closed after a ping/read timeout
+        // (up to ~45s after the link actually drops), so in that window `getConnectionState()`
+        // still returns Active and would let us render hours-old cached values as "OK".
+        // `NetworkHelper.hasActiveNetwork()` is a synchronous ConnectivityManager lookup that
+        // reflects the Android-level network state immediately.
+        val hasNetwork = networkHelper.hasActiveNetwork()
+        val connectionStateByServer = HashMap<Int, Boolean>()
         var sentCached = 0
         var sentPlaceholder = 0
         controlIds.forEach { controlId ->
@@ -660,8 +693,14 @@ class HaControlsProviderService : ControlsProviderService() {
                     ?: lastControlEntityIds.keys.firstOrNull() ?: return@forEach
                 val entityId = controlId.removePrefix("$serverId.")
                 val entity = cachedEntities[serverId]?.get(entityId)
+                val isConnected = connectionStateByServer.getOrPut(serverId) {
+                    isEntityStateTrustworthy(
+                        webSocketState = webSocketRepositoryCache[serverId]?.getConnectionState(),
+                        hasActiveNetwork = hasNetwork,
+                    )
+                }
 
-                if (entity != null) {
+                if (entity != null && isConnected) {
                     val domain = entityId.split(".")[0]
                     val haControl = domainToHaControl[domain] ?: return@forEach
                     val info = HaControlInfo(
@@ -675,8 +714,10 @@ class HaControlsProviderService : ControlsProviderService() {
                     subscriber.onNext(control)
                     sentCached++
                 } else {
-                    // No cached entity (e.g. after force-stop) - send placeholder to prevent
-                    // infinite loading spinner. The async path will replace it with real data.
+                    // Either no cached entity (cold start after force-stop) or WebSocket is not
+                    // currently Active (phone offline, HA restarting, …). In both cases we don't
+                    // know the real state, so emit a STATUS_UNKNOWN placeholder. The async path
+                    // will replace it with real data once the subscription delivers events.
                     val placeholderEntity = getFailedEntity(entityId, Exception())
                         .copy(state = "loading")
                     domainToHaControl["ha_failed"]?.createControl(
@@ -696,7 +737,10 @@ class HaControlsProviderService : ControlsProviderService() {
                 Timber.e(e, "Failed to send control for $controlId")
             }
         }
-        Timber.d("Sent $sentCached cached + $sentPlaceholder placeholder controls immediately")
+        Timber.d(
+            "Sent $sentCached cached + $sentPlaceholder placeholder controls " +
+                "(hasNetwork=$hasNetwork wsConnected=${connectionStateByServer.values})",
+        )
     }
 
     private fun getFailedEntity(entityId: String, exception: Exception): Entity {
@@ -734,3 +778,22 @@ class HaControlsProviderService : ControlsProviderService() {
         return prefsRepository.getControlsEnableStructure()
     }
 }
+
+/**
+ * Decides whether a cached entity state is recent enough to display as the real state in
+ * [HaControlsProviderService.sendCachedControlsImmediately].
+ *
+ * The cached value is only trustworthy when BOTH signals agree that we are currently online:
+ *  - [webSocketState] is [WebSocketState.Active], meaning the WebSocket handshake completed
+ *    and the [WebsocketManager] background sync is (or could be) delivering updates; AND
+ *  - [hasActiveNetwork] is `true`, meaning Android's `ConnectivityManager` reports that the
+ *    device has at least one usable transport right now.
+ *
+ * The second check is load-bearing because OkHttp only transitions the WebSocket state to
+ * `Closed` after a ping/read timeout (up to ~45s after the physical link dropped), so during
+ * that window `webSocketState` still reports `Active` even though the connection is dead.
+ * Without the `hasActiveNetwork` gate the user could tap a light from a cache that is hours
+ * old and believe the command was accepted.
+ */
+internal fun isEntityStateTrustworthy(webSocketState: WebSocketState?, hasActiveNetwork: Boolean): Boolean =
+    webSocketState == WebSocketState.Active && hasActiveNetwork

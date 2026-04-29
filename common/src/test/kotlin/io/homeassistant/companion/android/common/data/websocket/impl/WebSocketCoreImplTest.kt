@@ -3,6 +3,8 @@ package io.homeassistant.companion.android.common.data.websocket.impl
 import app.cash.turbine.test
 import app.cash.turbine.turbineScope
 import io.homeassistant.companion.android.common.data.authentication.AuthenticationRepository
+import io.homeassistant.companion.android.common.data.network.NetworkChangeObserver
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.servers.ServerConnectionStateProvider
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.servers.UrlState
@@ -38,6 +40,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
@@ -89,6 +92,12 @@ class WebSocketCoreImplTest {
         url: String = "https://io.ha",
         backgroundScope: CoroutineScope = this.backgroundScope,
         urlFlow: Flow<UrlState>? = null,
+        networkChangeObserver: NetworkChangeObserver = mockk(relaxed = true) {
+            every { observerNetworkChange } returns emptyFlow()
+        },
+        networkHelper: NetworkHelper = mockk(relaxed = true) {
+            every { hasActiveNetwork() } returns true
+        },
     ) {
         mockOkHttpClient = mockk<OkHttpClient>(relaxed = true)
         val mockServerManager = mockk<ServerManager>(relaxed = true)
@@ -117,11 +126,13 @@ class WebSocketCoreImplTest {
         // The implementation use a background scope to properly handle async messages, to not block the test
         // we are injecting a background scope to properly control it within the tests, the scope will close itself at the end of the test
         webSocketCore = WebSocketCoreImpl(
-            mockOkHttpClient,
-            mockServerManager,
-            testServerId,
-            this,
-            backgroundScope,
+            okHttpClient = mockOkHttpClient,
+            serverManager = mockServerManager,
+            serverId = testServerId,
+            networkChangeObserver = networkChangeObserver,
+            networkHelper = networkHelper,
+            wsScope = this,
+            backgroundScope = backgroundScope,
         )
         webSocketListener = webSocketCore
         every {
@@ -204,6 +215,8 @@ connect()
             okHttpClient = mockk(),
             serverManager = serverManager,
             serverId = 1,
+            networkChangeObserver = mockk(relaxed = true) { every { observerNetworkChange } returns emptyFlow() },
+            networkHelper = mockk(relaxed = true) { every { hasActiveNetwork() } returns true },
         )
 
         val result = webSocketCore.connect()
@@ -223,6 +236,8 @@ connect()
             okHttpClient = mockk(),
             serverManager = serverManager,
             serverId = 1,
+            networkChangeObserver = mockk(relaxed = true) { every { observerNetworkChange } returns emptyFlow() },
+            networkHelper = mockk(relaxed = true) { every { hasActiveNetwork() } returns true },
         )
 
         val result = webSocketCore.connect()
@@ -1471,5 +1486,89 @@ misc
 
         // Should not trigger reconnection since observer was cancelled
         assertFalse(reconnectAttempts, "URL observer should be cancelled after shutdown")
+    }
+
+    /*
+    networkChangeObserver listener
+     */
+
+    @Test
+    fun `Given active connection when network is lost then webSocket is force-closed`() = runTest {
+        val networkFlow = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 8)
+        val networkHelper = mockk<NetworkHelper>(relaxed = true)
+        every { networkHelper.hasActiveNetwork() } returns true
+
+        setupServer(
+            networkChangeObserver = mockk(relaxed = true) {
+                every { observerNetworkChange } returns networkFlow
+            },
+            networkHelper = networkHelper,
+        )
+        prepareAuthenticationAnswer()
+
+        val connected = webSocketCore.connect()
+        advanceUntilIdle()
+        assertTrue(connected)
+        assertEquals(WebSocketState.Active, webSocketCore.getConnectionState())
+
+        // Simulate Android reporting "no network". The emission triggers the listener, which
+        // now sees hasActiveNetwork() == false with a live holder, and force-closes the
+        // socket so handleClosingSocket runs immediately (no OkHttp ping timeout needed).
+        every { networkHelper.hasActiveNetwork() } returns false
+        assertTrue(networkFlow.tryEmit(Unit), "tryEmit should succeed with extraBufferCapacity")
+        advanceUntilIdle()
+        runCurrent()
+
+        verify { mockConnection.cancel() }
+    }
+
+    @Test
+    fun `Given no live connection when network is lost then no cancel happens`() = runTest {
+        // If the device is already offline when WebSocketCoreImpl is constructed, the
+        // listener may fire on the replayed current state before any connection exists.
+        // The connectionHolder != null guard must keep that path a no-op.
+        val networkFlow = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 8)
+        val networkHelper = mockk<NetworkHelper>(relaxed = true)
+        every { networkHelper.hasActiveNetwork() } returns false
+
+        setupServer(
+            networkChangeObserver = mockk(relaxed = true) {
+                every { observerNetworkChange } returns networkFlow
+            },
+            networkHelper = networkHelper,
+        )
+        networkFlow.emit(Unit)
+        advanceUntilIdle()
+
+        // No live WebSocket has been created yet, so nothing to cancel.
+        verify(exactly = 0) { mockConnection.cancel() }
+    }
+
+    @Test
+    fun `Given online device when network change arrives then socket is not closed`() = runTest {
+        // Covers the WiFi <-> cellular transport swap case: the observer emits but
+        // hasActiveNetwork() still returns true, so the listener must leave the socket alone
+        // and let OkHttp handle the underlying transport change.
+        val networkFlow = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 8)
+        val networkHelper = mockk<NetworkHelper>(relaxed = true)
+        every { networkHelper.hasActiveNetwork() } returns true
+
+        setupServer(
+            networkChangeObserver = mockk(relaxed = true) {
+                every { observerNetworkChange } returns networkFlow
+            },
+            networkHelper = networkHelper,
+        )
+        prepareAuthenticationAnswer()
+
+        val connected = webSocketCore.connect()
+        assertTrue(connected)
+
+        networkFlow.tryEmit(Unit)
+        advanceUntilIdle()
+        runCurrent()
+
+        verify(exactly = 0) { mockConnection.cancel() }
+        assertEquals(WebSocketState.Active, webSocketCore.getConnectionState())
     }
 }

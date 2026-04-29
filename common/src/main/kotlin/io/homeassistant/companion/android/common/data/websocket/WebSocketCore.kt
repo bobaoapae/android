@@ -1,5 +1,7 @@
 package io.homeassistant.companion.android.common.data.websocket
 
+import io.homeassistant.companion.android.common.data.network.NetworkChangeObserver
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.websocket.impl.WebSocketCoreImpl
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.RawMessageSocketResponse
@@ -77,6 +79,8 @@ internal class WebSocketCoreFactory @Inject constructor(
     private val okHttpClient: OkHttpClient,
     // Use a Provider to avoid a dependency circle since serverManager needs WebSocketCoreFactory
     private val serverManagerProvider: Provider<ServerManager>,
+    private val networkChangeObserver: NetworkChangeObserver,
+    private val networkHelper: NetworkHelper,
 ) {
 
     private val wsClient by lazy {
@@ -88,7 +92,13 @@ internal class WebSocketCoreFactory @Inject constructor(
     }
 
     fun create(serverId: Int): WebSocketCore {
-        return WebSocketCoreImpl(wsClient, serverManagerProvider.get(), serverId)
+        return WebSocketCoreImpl(
+            okHttpClient = wsClient,
+            serverManager = serverManagerProvider.get(),
+            serverId = serverId,
+            networkChangeObserver = networkChangeObserver,
+            networkHelper = networkHelper,
+        )
     }
 }
 

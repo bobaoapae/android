@@ -6,6 +6,8 @@ import io.homeassistant.companion.android.common.data.HomeAssistantApis.Companio
 import io.homeassistant.companion.android.common.data.HomeAssistantApis.Companion.USER_AGENT_STRING
 import io.homeassistant.companion.android.common.data.HomeAssistantVersion
 import io.homeassistant.companion.android.common.data.authentication.AuthorizationException
+import io.homeassistant.companion.android.common.data.network.NetworkChangeObserver
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.data.servers.UrlState
 import io.homeassistant.companion.android.common.data.websocket.HAWebSocketException
@@ -68,19 +70,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.onCompletion
-import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -134,6 +131,13 @@ private val DELAY_BEFORE_RECONNECT = 1.seconds
  * @param okHttpClient The HTTP client used to establish the WebSocket connection.
  * @param serverManager Manages server configurations and authentication.
  * @param serverId The ID of the server to connect to.
+ * @param networkChangeObserver Observes Android network changes to proactively close the
+ *   WebSocket when the device goes offline. Without this, the socket stays in `Active` state
+ *   until OkHttp's ping/read timeout (up to ~45s) detects the dead link, during which callers
+ *   would see stale cached data. Force-closing on `onLost` also unblocks any in-flight
+ *   `connect()` attempt that would otherwise wait out the 30s auth timeout.
+ * @param networkHelper Synchronous `ConnectivityManager` check to decide whether a network
+ *   change emission represents "went offline" (vs. just a capabilities change).
  * @param wsScope The coroutine scope used for WebSocket operations. Defaults to a scope with `Dispatchers.IO`.
  * @param backgroundScope A dedicated scope for background tasks, primarily used for testing.
  */
@@ -141,6 +145,8 @@ internal class WebSocketCoreImpl(
     private val okHttpClient: OkHttpClient,
     private val serverManager: ServerManager,
     private val serverId: Int,
+    private val networkChangeObserver: NetworkChangeObserver,
+    private val networkHelper: NetworkHelper,
     private val wsScope: CoroutineScope = CoroutineScope(
         Dispatchers.IO + SupervisorJob() +
             CoroutineExceptionHandler { ctx, err -> Timber.e(err, "Uncaught exception in WebSocketCoreImpl") },
@@ -223,6 +229,34 @@ internal class WebSocketCoreImpl(
      * during flow cancellation.
      */
     private val eventSubscriptionMutex = Mutex()
+
+    init {
+        // Proactively close the WebSocket the moment Android reports "no network", instead of
+        // waiting for OkHttp's ping/read timeout (up to ~45s) to detect the dead link.
+        // Cancelling the socket triggers [handleClosingSocket], which transitions
+        // [connectionState] to Closed and releases any [pendingConnectDeferred] waiting on
+        // [awaitAuthAndSetupConnectionHolder]'s 30s auth timeout — unblocking callers
+        // immediately when the user re-enables the network.
+        //
+        // The [NetworkChangeObserver] replays its current state as the first emission
+        // (replay=1), which can arrive before the first connection attempt. We don't need to
+        // skip it because the `connectionHolder != null` guard below makes the handler a no-op
+        // when there's nothing connected yet.
+        //
+        // Launched on [backgroundScope] (not [wsScope]) so tests can inject a TestScope's
+        // backgroundScope and have the listener auto-cancel at the end of the test body.
+        backgroundScope.launch {
+            networkChangeObserver.observerNetworkChange.collect {
+                if (!networkHelper.hasActiveNetwork()) {
+                    val holder = connectionHolder.get()
+                    if (holder != null) {
+                        Timber.i("Network lost, force-closing WebSocket to short-circuit OkHttp ping timeout")
+                        holder.webSocket.cancel()
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Queue for processing incoming WebSocket messages sequentially.

@@ -9,6 +9,7 @@ import androidx.work.ListenableWorker
 import androidx.work.testing.TestListenableWorkerBuilder
 import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.android.testing.HiltTestApplication
+import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.database.server.Server
 import io.homeassistant.companion.android.database.settings.SensorUpdateFrequencySetting
@@ -48,6 +49,7 @@ class WebsocketManagerTest {
     private val entryPoint = object : WebsocketManager.WebsocketManagerEntryPoint {
         val dao = mockk<SettingsDao>()
         val messagingManager = mockk<MessagingManager>()
+        val prefsRepository = mockk<PrefsRepository>(relaxed = true)
         val serverManager = mockk<ServerManager>(relaxed = true).apply {
             coEvery { servers() } returns listOf(mockk<Server>(relaxed = true))
             // Test does not cover websocket monitoring right now, failsafe to end quickly if it tries
@@ -57,6 +59,7 @@ class WebsocketManagerTest {
         override fun serverManager(): ServerManager = serverManager
         override fun messagingManager(): MessagingManager = messagingManager
         override fun settingsDao(): SettingsDao = dao
+        override fun prefsRepository(): PrefsRepository = prefsRepository
     }
 
     private fun mockSetting(setting: WebsocketSetting) {
