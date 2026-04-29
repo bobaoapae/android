@@ -13,10 +13,9 @@ class IsLiveConnectionTrustworthyTest {
 
     @Test
     fun `Given WebSocket Active but no active network when checking then returns false`() {
-        // Bug 2 scenario: OkHttp hasn't detected the dropped link yet (ping/read timeout
-        // takes up to ~45s), so the WebSocket state is still Active. Android's
-        // ConnectivityManager already reports no transport, which must win: rendering
-        // the cached state as live would mislead the user.
+        // OkHttp lags up to ~45s before transitioning to Closed after a dropped link, so the
+        // WebSocket can still report Active while ConnectivityManager already reports no
+        // transport. The latter must win to avoid presenting stale state as live.
         assertFalse(isLiveConnectionTrustworthy(webSocketState = WebSocketState.Active, hasActiveNetwork = false))
     }
 
@@ -38,7 +37,7 @@ class IsLiveConnectionTrustworthyTest {
 
     @Test
     fun `Given WebSocket Authenticating when checking then returns false`() {
-        // During the TLS + auth handshake we are not yet receiving entity events.
+        // The TLS and auth handshake is still in progress, no entity events flowing yet.
         assertFalse(
             isLiveConnectionTrustworthy(
                 webSocketState = WebSocketState.Authenticating,

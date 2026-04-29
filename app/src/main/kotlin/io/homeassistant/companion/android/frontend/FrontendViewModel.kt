@@ -41,7 +41,6 @@ import javax.inject.Inject
 import kotlin.math.pow
 import kotlin.random.Random
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -621,10 +620,9 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private fun onError(error: FrontendConnectionError) {
         if (shouldAutoRetry(error)) {
             scheduleAutoRetry(error)
-            // Stay on LoadingScreen for the duration of the retry window — never transition to
-            // Error so the user does not see an error flash for transient WebView failures
-            // (slow page load, expired token mid-load, momentary SSL glitch) when the
-            // background WebSocket pipeline is healthy.
+            // Skip the Error transition so the UI keeps rendering LoadingScreen while the retry
+            // is scheduled, hiding transient WebView failures (slow page load, briefly expired
+            // token mid-load, momentary SSL glitch) whenever the background WebSocket is healthy.
             return
         }
         autoRetryJob?.cancel()
@@ -633,14 +631,15 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     }
 
     /**
-     * Whether [onError] should silently retry instead of surfacing the error screen.
+     * Returns whether [onError] should schedule a silent retry instead of surfacing the error.
      *
-     * The check is intentionally cheap (synchronous) so it can run on the [onError] code path:
-     * the strict [WebSocketState] check happens later in [scheduleAutoRetry] after the backoff
-     * delay, so the gate stays accurate at fire time.
+     * The gate is intentionally synchronous so it can run on the [onError] hot path. The strict
+     * [WebSocketState] check is deferred to [scheduleAutoRetry], where it runs after the backoff
+     * delay so the answer reflects the WebSocket state at fire time rather than at error time.
      *
-     * Auto-retry only applies to [FrontendConnectionError.UnreachableError] — auth, unknown,
-     * and unrecoverable errors will not be solved by retrying and would only delay user feedback.
+     * Only [FrontendConnectionError.UnreachableError] qualifies. Authentication, unknown, and
+     * unrecoverable errors will not be fixed by retrying and surfacing them immediately gives
+     * the user faster feedback.
      */
     private fun shouldAutoRetry(error: FrontendConnectionError): Boolean =
         error is FrontendConnectionError.UnreachableError &&
@@ -658,34 +657,26 @@ internal class FrontendViewModel @VisibleForTesting constructor(
 
         autoRetryJob?.cancel()
         autoRetryJob = viewModelScope.launch {
-            try {
-                delay(backoff)
+            delay(backoff)
 
-                // Strict re-check at fire time. webSocketRepository(serverId) is suspend, so this
-                // could not run synchronously inside onError; doing it here also gives the WebSocket
-                // a chance to flip Active during the backoff if it was mid-handshake when the error
-                // first fired.
-                val serverId = _viewState.value.serverId
-                val webSocketState: WebSocketState? = try {
-                    serverManager.webSocketRepository(serverId).getConnectionState()
-                } catch (e: IllegalStateException) {
-                    Timber.w(e, "No WebSocketRepository for server=$serverId at retry fire time")
-                    null
-                }
-                if (!isLiveConnectionTrustworthy(webSocketState, networkHelper.hasActiveNetwork())) {
-                    Timber.i("Frontend auto-retry aborted at fire time; surfacing error")
-                    emitErrorState(error)
-                    return@launch
-                }
-
-                Timber.i("Frontend auto-retry firing: attempt=${attempt + 1}")
-                performLoadServerForRetry()
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (t: Throwable) {
-                Timber.e(t, "Frontend auto-retry failed unexpectedly; surfacing error")
-                emitErrorState(error)
+            // Strict gate re-check at fire time: webSocketRepository(serverId) is suspend so the
+            // synchronous gate in shouldAutoRetry skipped it. Running it here also covers the
+            // case where the WebSocket flips to Active during the backoff window.
+            val serverId = _viewState.value.serverId
+            val webSocketState: WebSocketState? = try {
+                serverManager.webSocketRepository(serverId).getConnectionState()
+            } catch (e: IllegalStateException) {
+                Timber.w(e, "No WebSocketRepository for server=$serverId at retry fire time")
+                null
             }
+            if (!isLiveConnectionTrustworthy(webSocketState, networkHelper.hasActiveNetwork())) {
+                Timber.i("Frontend auto-retry aborted at fire time; surfacing error")
+                emitErrorState(error)
+                return@launch
+            }
+
+            Timber.i("Frontend auto-retry firing: attempt=${attempt + 1}")
+            performLoadServerForRetry()
         }
     }
 

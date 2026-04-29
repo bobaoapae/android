@@ -1436,35 +1436,30 @@ class FrontendViewModelTest {
 
         @Test
         fun `Given pending auto-retry when user calls onRetry then pending job is cancelled and fresh load fires`() = runTest {
-            // Use a non-replaying SharedFlow with extra buffer so we can control exactly which
-            // emission each collector sees. This makes "the pending auto-retry was cancelled"
-            // observable via the call counts on serverUrlFlow.
+            // Non-replaying SharedFlow with buffer so each collector receives only emissions that
+            // happen while it is subscribed. This makes the cancelled-retry path observable as
+            // a missing serverUrlFlow call.
             val urlFlow = MutableSharedFlow<UrlLoadResult>(replay = 0, extraBufferCapacity = 8)
             every { urlManager.serverUrlFlow(any(), any()) } returns urlFlow
 
             val viewModel = createViewModel()
-            // Let the initial collector subscribe before we emit, then trigger the first error.
             advanceTimeBy(50.milliseconds)
             urlFlow.tryEmit(UrlLoadResult.NoUrlAvailable(serverId))
             advanceTimeBy(200.milliseconds)
             assertTrue(viewModel.viewState.value !is FrontendViewState.Error)
-            // Initial collection only — the scheduled retry has not fired yet.
             verify(exactly = 1) { urlManager.serverUrlFlow(any(), any()) }
 
-            // User taps Retry before the backoff fires. This must cancel the pending retry job
-            // and start a fresh load.
             viewModel.onRetry()
             advanceTimeBy(50.milliseconds)
             verify(exactly = 2) { urlManager.serverUrlFlow(any(), any()) }
-            // Feed the user's collector a Success so this branch terminates cleanly. We only run
-            // pending tasks (no time advance) to avoid firing the Loading-state's 10s timeout
-            // watcher, which would itself cascade back into the auto-retry path under the healthy
-            // gate and mask the cancellation we are trying to verify.
+            // Success terminates the new collector cleanly. runCurrent() avoids advancing past
+            // the Loading-state 10s timeout watcher, which would otherwise schedule another
+            // auto-retry under the healthy gate and confuse the cancellation assertion.
             urlFlow.tryEmit(UrlLoadResult.Success(testUrlWithAuth, serverId))
             runCurrent()
 
-            // Advance past the cancelled job's worst-case backoff (1s base + 500ms jitter for the
-            // first attempt). If cancellation did not work, we'd observe a 3rd serverUrlFlow call.
+            // Advance past the cancelled job's worst-case backoff (1s base + 500ms jitter on
+            // the first attempt). A 3rd serverUrlFlow call would prove cancellation did not work.
             advanceTimeBy(2.seconds)
 
             verify(exactly = 2) { urlManager.serverUrlFlow(any(), any()) }
@@ -1505,14 +1500,13 @@ class FrontendViewModelTest {
             advanceUntilIdle()
             assertTrue(viewModel.viewState.value is FrontendViewState.Error)
 
-            // User taps Retry. This should reset the budget and start a fresh round of auto-retries.
             viewModel.onRetry()
             advanceTimeBy(maxBackoffWindow)
             advanceUntilIdle()
 
-            // Without the reset, no auto-retry would fire after the manual retry. With the reset,
-            // we get at least one more collection beyond the (1 initial + MAX_FRONTEND_AUTO_RETRIES) prior calls
-            // and the immediate post-onRetry collection.
+            // Without the reset, no auto-retry would fire after the manual retry. The lower bound
+            // covers the 1 initial collection + MAX_FRONTEND_AUTO_RETRIES (pre-exhaustion retries)
+            // + 1 onRetry-triggered collection + at least 1 fresh auto-retry.
             verify(atLeast = MAX_FRONTEND_AUTO_RETRIES + 3) { urlManager.serverUrlFlow(any(), any()) }
         }
     }
