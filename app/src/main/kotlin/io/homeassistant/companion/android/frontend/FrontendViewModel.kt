@@ -9,7 +9,11 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import io.homeassistant.companion.android.common.R as commonR
 import io.homeassistant.companion.android.common.data.connectivity.ConnectivityCheckRepository
 import io.homeassistant.companion.android.common.data.connectivity.ConnectivityCheckState
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
+import io.homeassistant.companion.android.common.data.servers.ServerManager
+import io.homeassistant.companion.android.common.data.websocket.WebSocketState
+import io.homeassistant.companion.android.common.data.websocket.isLiveConnectionTrustworthy
 import io.homeassistant.companion.android.common.util.GestureDirection
 import io.homeassistant.companion.android.frontend.dialog.FrontendDialogManager
 import io.homeassistant.companion.android.frontend.download.DownloadResult
@@ -34,7 +38,10 @@ import io.homeassistant.companion.android.util.HAWebChromeClient
 import io.homeassistant.companion.android.util.HAWebViewClient
 import io.homeassistant.companion.android.util.HAWebViewClientFactory
 import javax.inject.Inject
+import kotlin.math.pow
+import kotlin.random.Random
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -60,6 +67,26 @@ import timber.log.Timber
 val CONNECTION_TIMEOUT = 10.seconds
 
 /**
+ * Maximum number of consecutive silent retries before surfacing the connection error screen.
+ *
+ * Counter resets on a successful Content transition or a user-initiated [FrontendViewModel.onRetry].
+ */
+@VisibleForTesting
+internal const val MAX_FRONTEND_AUTO_RETRIES = 3
+
+/** Base backoff for the first auto-retry. Subsequent attempts double until [AUTO_RETRY_BACKOFF_CAP]. */
+@VisibleForTesting
+internal val AUTO_RETRY_BACKOFF_BASE = 1.seconds
+
+/** Maximum backoff between auto-retries. */
+@VisibleForTesting
+internal val AUTO_RETRY_BACKOFF_CAP = 5.seconds
+
+/** Maximum random jitter added to the computed backoff to de-sync clients. */
+@VisibleForTesting
+internal const val AUTO_RETRY_JITTER_MAX_MS = 500L
+
+/**
  * ViewModel for frontend screen.
  *
  * Handles loading the Home Assistant WebView, authentication, external bus communication,
@@ -82,6 +109,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private val gestureHandler: FrontendGestureHandler,
     private val prefsRepository: PrefsRepository,
     private val dialogManager: FrontendDialogManager,
+    private val serverManager: ServerManager,
+    private val networkHelper: NetworkHelper,
 ) : ViewModel(),
     FrontendConnectionErrorStateProvider {
 
@@ -99,6 +128,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         gestureHandler: FrontendGestureHandler,
         prefsRepository: PrefsRepository,
         dialogManager: FrontendDialogManager,
+        serverManager: ServerManager,
+        networkHelper: NetworkHelper,
     ) : this(
         initialServerId = savedStateHandle.toRoute<FrontendRoute>().serverId,
         initialPath = savedStateHandle.toRoute<FrontendRoute>().path,
@@ -113,6 +144,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         gestureHandler = gestureHandler,
         prefsRepository = prefsRepository,
         dialogManager = dialogManager,
+        serverManager = serverManager,
+        networkHelper = networkHelper,
     )
 
     /**
@@ -220,6 +253,19 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     /** Job tracking the zoom settings flow collection - restarted on each page load. */
     private var zoomObserverJob: Job? = null
 
+    /**
+     * Number of consecutive silent retries scheduled since the last successful Content
+     * transition or user-initiated [onRetry]. Reset to 0 on `Connected` (successful load),
+     * `onRetry`, and `switchServer`.
+     */
+    private var autoRetryCount: Int = 0
+
+    /**
+     * Pending auto-retry coroutine. Cancelled on user retry, switchServer, or when the
+     * ViewModel is cleared (the latter automatically because it lives in [viewModelScope]).
+     */
+    private var autoRetryJob: Job? = null
+
     init {
         // Timeout watcher - cancels automatically when state changes from Loading
         viewModelScope.launch {
@@ -264,6 +310,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     }
 
     fun onRetry() {
+        autoRetryJob?.cancel()
+        autoRetryCount = 0
         _viewState.update {
             FrontendViewState.LoadServer(serverId = it.serverId)
         }
@@ -292,6 +340,8 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     }
 
     fun switchServer(serverId: Int) {
+        autoRetryJob?.cancel()
+        autoRetryCount = 0
         _viewState.update {
             FrontendViewState.LoadServer(serverId = serverId)
         }
@@ -419,8 +469,10 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     private suspend fun handleMessageResult(result: FrontendHandlerEvent) {
         when (result) {
             is FrontendHandlerEvent.Connected -> {
+                var transitioned = false
                 _viewState.update { currentState ->
                     if (currentState is FrontendViewState.Loading) {
+                        transitioned = true
                         FrontendViewState.Content(
                             serverId = currentState.serverId,
                             url = currentState.url,
@@ -428,6 +480,10 @@ internal class FrontendViewModel @VisibleForTesting constructor(
                     } else {
                         currentState
                     }
+                }
+                if (transitioned) {
+                    autoRetryCount = 0
+                    autoRetryJob?.cancel()
                 }
                 permissionManager.checkNotificationPermission(_viewState.value.serverId)
             }
@@ -563,6 +619,77 @@ internal class FrontendViewModel @VisibleForTesting constructor(
     }
 
     private fun onError(error: FrontendConnectionError) {
+        if (shouldAutoRetry(error)) {
+            scheduleAutoRetry(error)
+            // Stay on LoadingScreen for the duration of the retry window — never transition to
+            // Error so the user does not see an error flash for transient WebView failures
+            // (slow page load, expired token mid-load, momentary SSL glitch) when the
+            // background WebSocket pipeline is healthy.
+            return
+        }
+        autoRetryJob?.cancel()
+        autoRetryCount = 0
+        emitErrorState(error)
+    }
+
+    /**
+     * Whether [onError] should silently retry instead of surfacing the error screen.
+     *
+     * The check is intentionally cheap (synchronous) so it can run on the [onError] code path:
+     * the strict [WebSocketState] check happens later in [scheduleAutoRetry] after the backoff
+     * delay, so the gate stays accurate at fire time.
+     *
+     * Auto-retry only applies to [FrontendConnectionError.UnreachableError] — auth, unknown,
+     * and unrecoverable errors will not be solved by retrying and would only delay user feedback.
+     */
+    private fun shouldAutoRetry(error: FrontendConnectionError): Boolean =
+        error is FrontendConnectionError.UnreachableError &&
+            autoRetryCount < MAX_FRONTEND_AUTO_RETRIES &&
+            networkHelper.hasActiveNetwork()
+
+    private fun scheduleAutoRetry(error: FrontendConnectionError) {
+        val attempt = autoRetryCount
+        autoRetryCount = attempt + 1
+        val backoff = computeBackoffMillis(attempt)
+        Timber.i(
+            "Frontend auto-retry scheduled: attempt=${attempt + 1}/$MAX_FRONTEND_AUTO_RETRIES, " +
+                "backoff=${backoff}ms, error=${error.rawErrorType}",
+        )
+
+        autoRetryJob?.cancel()
+        autoRetryJob = viewModelScope.launch {
+            try {
+                delay(backoff)
+
+                // Strict re-check at fire time. webSocketRepository(serverId) is suspend, so this
+                // could not run synchronously inside onError; doing it here also gives the WebSocket
+                // a chance to flip Active during the backoff if it was mid-handshake when the error
+                // first fired.
+                val serverId = _viewState.value.serverId
+                val webSocketState: WebSocketState? = try {
+                    serverManager.webSocketRepository(serverId).getConnectionState()
+                } catch (e: IllegalStateException) {
+                    Timber.w(e, "No WebSocketRepository for server=$serverId at retry fire time")
+                    null
+                }
+                if (!isLiveConnectionTrustworthy(webSocketState, networkHelper.hasActiveNetwork())) {
+                    Timber.i("Frontend auto-retry aborted at fire time; surfacing error")
+                    emitErrorState(error)
+                    return@launch
+                }
+
+                Timber.i("Frontend auto-retry firing: attempt=${attempt + 1}")
+                performLoadServerForRetry()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Timber.e(t, "Frontend auto-retry failed unexpectedly; surfacing error")
+                emitErrorState(error)
+            }
+        }
+    }
+
+    private fun emitErrorState(error: FrontendConnectionError) {
         _viewState.update { currentState ->
             FrontendViewState.Error(
                 serverId = currentState.serverId,
@@ -572,6 +699,23 @@ internal class FrontendViewModel @VisibleForTesting constructor(
         }
         // Automatically run connectivity checks when an error occurs
         runConnectivityChecks()
+    }
+
+    /**
+     * Triggers the same load-server flow as [onRetry] but WITHOUT resetting [autoRetryCount].
+     * Used by [scheduleAutoRetry] so consecutive failed retries respect [MAX_FRONTEND_AUTO_RETRIES].
+     */
+    private fun performLoadServerForRetry() {
+        _viewState.update { FrontendViewState.LoadServer(serverId = it.serverId) }
+        loadServer()
+    }
+
+    private fun computeBackoffMillis(attempt: Int): Long {
+        val base = AUTO_RETRY_BACKOFF_BASE.inWholeMilliseconds
+        val cap = AUTO_RETRY_BACKOFF_CAP.inWholeMilliseconds
+        val exp = (base * 2.0.pow(attempt)).toLong().coerceAtMost(cap)
+        val jitter = Random.nextLong(0, AUTO_RETRY_JITTER_MAX_MS + 1)
+        return exp + jitter
     }
 
     /**

@@ -21,6 +21,7 @@ import io.homeassistant.companion.android.common.data.websocket.WebSocketState
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.AreaRegistryResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.DeviceRegistryResponse
 import io.homeassistant.companion.android.common.data.websocket.impl.entities.EntityRegistryResponse
+import io.homeassistant.companion.android.common.data.websocket.isLiveConnectionTrustworthy
 import io.homeassistant.companion.android.util.RegistriesDataHandler
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
@@ -694,7 +695,7 @@ class HaControlsProviderService : ControlsProviderService() {
                 val entityId = controlId.removePrefix("$serverId.")
                 val entity = cachedEntities[serverId]?.get(entityId)
                 val isConnected = connectionStateByServer.getOrPut(serverId) {
-                    isEntityStateTrustworthy(
+                    isLiveConnectionTrustworthy(
                         webSocketState = webSocketRepositoryCache[serverId]?.getConnectionState(),
                         hasActiveNetwork = hasNetwork,
                     )
@@ -778,22 +779,3 @@ class HaControlsProviderService : ControlsProviderService() {
         return prefsRepository.getControlsEnableStructure()
     }
 }
-
-/**
- * Decides whether a cached entity state is recent enough to display as the real state in
- * [HaControlsProviderService.sendCachedControlsImmediately].
- *
- * The cached value is only trustworthy when BOTH signals agree that we are currently online:
- *  - [webSocketState] is [WebSocketState.Active], meaning the WebSocket handshake completed
- *    and the [WebsocketManager] background sync is (or could be) delivering updates; AND
- *  - [hasActiveNetwork] is `true`, meaning Android's `ConnectivityManager` reports that the
- *    device has at least one usable transport right now.
- *
- * The second check is load-bearing because OkHttp only transitions the WebSocket state to
- * `Closed` after a ping/read timeout (up to ~45s after the physical link dropped), so during
- * that window `webSocketState` still reports `Active` even though the connection is dead.
- * Without the `hasActiveNetwork` gate the user could tap a light from a cache that is hours
- * old and believe the command was accepted.
- */
-internal fun isEntityStateTrustworthy(webSocketState: WebSocketState?, hasActiveNetwork: Boolean): Boolean =
-    webSocketState == WebSocketState.Active && hasActiveNetwork

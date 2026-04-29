@@ -7,8 +7,12 @@ import io.homeassistant.companion.android.common.R as commonR
 import io.homeassistant.companion.android.common.data.connectivity.ConnectivityCheckRepository
 import io.homeassistant.companion.android.common.data.connectivity.ConnectivityCheckResult
 import io.homeassistant.companion.android.common.data.connectivity.ConnectivityCheckState
+import io.homeassistant.companion.android.common.data.network.NetworkHelper
 import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.prefs.ZoomSettings
+import io.homeassistant.companion.android.common.data.servers.ServerManager
+import io.homeassistant.companion.android.common.data.websocket.WebSocketRepository
+import io.homeassistant.companion.android.common.data.websocket.WebSocketState
 import io.homeassistant.companion.android.common.util.GestureDirection
 import io.homeassistant.companion.android.frontend.dialog.FrontendDialog
 import io.homeassistant.companion.android.frontend.dialog.FrontendDialogManager
@@ -37,6 +41,7 @@ import io.mockk.just
 import io.mockk.mockk
 import io.mockk.runs
 import io.mockk.verify
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -47,6 +52,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonObject
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -78,6 +84,12 @@ class FrontendViewModelTest {
         coEvery { this@mockk.zoomSettingsFlow() } returns this@FrontendViewModelTest.zoomSettingsFlow
     }
 
+    private val webSocketRepository: WebSocketRepository = mockk(relaxed = true)
+    private val serverManager: ServerManager = mockk(relaxed = true) {
+        coEvery { webSocketRepository(any()) } returns this@FrontendViewModelTest.webSocketRepository
+    }
+    private val networkHelper: NetworkHelper = mockk(relaxed = true)
+
     private val serverId = 1
     private val testUrlWithAuth = "https://example.com?external_auth=1"
 
@@ -86,6 +98,10 @@ class FrontendViewModelTest {
         every { frontendBusObserver.messageResults() } returns emptyFlow()
         every { frontendBusObserver.webViewActions() } returns emptyFlow()
         every { connectivityCheckRepository.runChecks(any()) } returns flowOf(ConnectivityCheckState())
+        // Default: gate fails (no auto-retry) so the existing tests see Error state immediately
+        // when a recoverable error fires. The AutoRetry nested class overrides these per-test.
+        every { networkHelper.hasActiveNetwork() } returns false
+        every { webSocketRepository.getConnectionState() } returns WebSocketState.ClosedOther
     }
 
     private fun createViewModel(
@@ -107,6 +123,8 @@ class FrontendViewModelTest {
             gestureHandler = gestureHandler,
             prefsRepository = prefsRepository,
             dialogManager = dialogManager,
+            serverManager = serverManager,
+            networkHelper = networkHelper,
         )
     }
 
@@ -1299,6 +1317,203 @@ class FrontendViewModelTest {
                     serverId = serverId,
                 )
             }
+        }
+    }
+
+    @Nested
+    inner class AutoRetry {
+
+        /**
+         * Worst-case backoff for one auto-retry attempt: cap (5s) + jitter (500ms) = 5500ms.
+         * Used as the upper bound when waiting for a scheduled retry to fire in the tests.
+         */
+        private val maxBackoffWindow = 5500.milliseconds
+
+        @BeforeEach
+        fun healthyGateDefaults() {
+            every { networkHelper.hasActiveNetwork() } returns true
+            every { webSocketRepository.getConnectionState() } returns WebSocketState.Active
+        }
+
+        @Test
+        fun `Given UnreachableError plus healthy gate when error fires then state stays out of Error and retry happens`() = runTest {
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.NoUrlAvailable(serverId),
+            )
+
+            val viewModel = createViewModel()
+
+            // Initial collection consumes NoUrlAvailable -> onError -> shouldAutoRetry -> schedule retry.
+            // The state must NOT transition to Error during the backoff window — that is the whole point.
+            advanceTimeBy(500.milliseconds)
+            assertTrue(
+                viewModel.viewState.value !is FrontendViewState.Error,
+                "Expected non-Error state during auto-retry backoff but got ${viewModel.viewState.value}",
+            )
+
+            // Advance past the worst-case backoff so the retry has fired and re-collected the flow.
+            advanceTimeBy(maxBackoffWindow)
+            advanceUntilIdle()
+
+            // urlManager.serverUrlFlow is called once for the initial load and at least once more
+            // for the auto-retry. After the retry budget exhausts, the state finally becomes Error.
+            verify(atLeast = 2) { urlManager.serverUrlFlow(any(), any()) }
+        }
+
+        @Test
+        fun `Given UnreachableError but WebSocket Closed when retry fires then Error state is set`() = runTest {
+            every { webSocketRepository.getConnectionState() } returns WebSocketState.ClosedOther
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.NoUrlAvailable(serverId),
+            )
+
+            val viewModel = createViewModel()
+            // Schedule fires after backoff, gate fails (WS not Active), emit Error.
+            advanceTimeBy(maxBackoffWindow)
+            advanceUntilIdle()
+
+            assertTrue(
+                viewModel.viewState.value is FrontendViewState.Error,
+                "Expected Error after gate fails but got ${viewModel.viewState.value}",
+            )
+            // Only the initial collection — the retry job aborted before performLoadServerForRetry().
+            verify(exactly = 1) { urlManager.serverUrlFlow(any(), any()) }
+        }
+
+        @Test
+        fun `Given UnreachableError but no active network when error fires then Error state set immediately`() = runTest {
+            every { networkHelper.hasActiveNetwork() } returns false
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.NoUrlAvailable(serverId),
+            )
+
+            val viewModel = createViewModel()
+            advanceUntilIdle()
+
+            assertTrue(viewModel.viewState.value is FrontendViewState.Error)
+            // Synchronous bail in shouldAutoRetry — never reached the suspend WS lookup.
+            coVerify(exactly = 0) { serverManager.webSocketRepository(any()) }
+        }
+
+        @Test
+        fun `Given AuthenticationError when error fires then no auto-retry is scheduled`() = runTest {
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.SessionNotConnected(serverId),
+            )
+
+            val viewModel = createViewModel()
+            advanceUntilIdle()
+
+            assertTrue(
+                (viewModel.viewState.value as? FrontendViewState.Error)?.error is FrontendConnectionError.AuthenticationError,
+            )
+            // Auth errors never go through scheduleAutoRetry, so the suspend WS lookup is never called.
+            coVerify(exactly = 0) { serverManager.webSocketRepository(any()) }
+            verify(exactly = 1) { urlManager.serverUrlFlow(any(), any()) }
+        }
+
+        @Test
+        fun `Given consecutive UnreachableErrors when budget exhausts then Error state is set`() = runTest {
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.NoUrlAvailable(serverId),
+            )
+
+            val viewModel = createViewModel()
+            // Walk past every retry attempt: 4 errors total (initial + 3 retries) before exhaustion.
+            // Each retry waits up to maxBackoffWindow.
+            repeat(MAX_FRONTEND_AUTO_RETRIES + 1) {
+                advanceTimeBy(maxBackoffWindow)
+            }
+            advanceUntilIdle()
+
+            assertTrue(
+                viewModel.viewState.value is FrontendViewState.Error,
+                "Expected Error after retry budget exhausts but got ${viewModel.viewState.value}",
+            )
+            // 1 initial + MAX_FRONTEND_AUTO_RETRIES auto-retries.
+            verify(exactly = MAX_FRONTEND_AUTO_RETRIES + 1) { urlManager.serverUrlFlow(any(), any()) }
+        }
+
+        @Test
+        fun `Given pending auto-retry when user calls onRetry then pending job is cancelled and fresh load fires`() = runTest {
+            // Use a non-replaying SharedFlow with extra buffer so we can control exactly which
+            // emission each collector sees. This makes "the pending auto-retry was cancelled"
+            // observable via the call counts on serverUrlFlow.
+            val urlFlow = MutableSharedFlow<UrlLoadResult>(replay = 0, extraBufferCapacity = 8)
+            every { urlManager.serverUrlFlow(any(), any()) } returns urlFlow
+
+            val viewModel = createViewModel()
+            // Let the initial collector subscribe before we emit, then trigger the first error.
+            advanceTimeBy(50.milliseconds)
+            urlFlow.tryEmit(UrlLoadResult.NoUrlAvailable(serverId))
+            advanceTimeBy(200.milliseconds)
+            assertTrue(viewModel.viewState.value !is FrontendViewState.Error)
+            // Initial collection only — the scheduled retry has not fired yet.
+            verify(exactly = 1) { urlManager.serverUrlFlow(any(), any()) }
+
+            // User taps Retry before the backoff fires. This must cancel the pending retry job
+            // and start a fresh load.
+            viewModel.onRetry()
+            advanceTimeBy(50.milliseconds)
+            verify(exactly = 2) { urlManager.serverUrlFlow(any(), any()) }
+            // Feed the user's collector a Success so this branch terminates cleanly. We only run
+            // pending tasks (no time advance) to avoid firing the Loading-state's 10s timeout
+            // watcher, which would itself cascade back into the auto-retry path under the healthy
+            // gate and mask the cancellation we are trying to verify.
+            urlFlow.tryEmit(UrlLoadResult.Success(testUrlWithAuth, serverId))
+            runCurrent()
+
+            // Advance past the cancelled job's worst-case backoff (1s base + 500ms jitter for the
+            // first attempt). If cancellation did not work, we'd observe a 3rd serverUrlFlow call.
+            advanceTimeBy(2.seconds)
+
+            verify(exactly = 2) { urlManager.serverUrlFlow(any(), any()) }
+        }
+
+        @Test
+        fun `Given switchServer called while auto-retry pending then retry job is cancelled`() = runTest {
+            every { urlManager.serverUrlFlow(1, any()) } returns flowOf(UrlLoadResult.NoUrlAvailable(1))
+            every { urlManager.serverUrlFlow(2, any()) } returns flowOf(
+                UrlLoadResult.Success(url = "https://server2.com?external_auth=1", serverId = 2),
+            )
+
+            val viewModel = createViewModel(serverId = 1)
+            // Schedule auto-retry on server 1.
+            advanceTimeBy(200.milliseconds)
+
+            viewModel.switchServer(2)
+            advanceTimeBy(maxBackoffWindow)
+            advanceUntilIdle()
+
+            // Server 1 collected once initially; the scheduled retry must NOT have fired after switchServer.
+            verify(exactly = 1) { urlManager.serverUrlFlow(1, any()) }
+            verify(atLeast = 1) { urlManager.serverUrlFlow(2, any()) }
+            assertEquals(2, viewModel.viewState.value.serverId)
+        }
+
+        @Test
+        fun `Given retry budget exhausted then onRetry resets the budget`() = runTest {
+            every { urlManager.serverUrlFlow(any(), any()) } returns flowOf(
+                UrlLoadResult.NoUrlAvailable(serverId),
+            )
+
+            val viewModel = createViewModel()
+            // Exhaust retries: 1 initial + 3 auto-retries -> Error.
+            repeat(MAX_FRONTEND_AUTO_RETRIES + 1) {
+                advanceTimeBy(maxBackoffWindow)
+            }
+            advanceUntilIdle()
+            assertTrue(viewModel.viewState.value is FrontendViewState.Error)
+
+            // User taps Retry. This should reset the budget and start a fresh round of auto-retries.
+            viewModel.onRetry()
+            advanceTimeBy(maxBackoffWindow)
+            advanceUntilIdle()
+
+            // Without the reset, no auto-retry would fire after the manual retry. With the reset,
+            // we get at least one more collection beyond the (1 initial + MAX_FRONTEND_AUTO_RETRIES) prior calls
+            // and the immediate post-onRetry collection.
+            verify(atLeast = MAX_FRONTEND_AUTO_RETRIES + 3) { urlManager.serverUrlFlow(any(), any()) }
         }
     }
 }
