@@ -1,9 +1,11 @@
 package io.homeassistant.companion.android.frontend.navigation
 
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.annotation.VisibleForTesting
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalResources
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.navigation.NavController
 import androidx.navigation.NavGraphBuilder
@@ -16,8 +18,8 @@ import io.homeassistant.companion.android.assist.AssistActivity
 import io.homeassistant.companion.android.common.data.servers.ServerManager.Companion.SERVER_ID_ACTIVE
 import io.homeassistant.companion.android.frontend.FrontendScreen
 import io.homeassistant.companion.android.frontend.FrontendViewModel
-import io.homeassistant.companion.android.frontend.FrontendViewState
 import io.homeassistant.companion.android.launch.HAStartDestinationRoute
+import io.homeassistant.companion.android.nfc.WriteNfcTag
 import io.homeassistant.companion.android.settings.SettingsActivity
 import io.homeassistant.companion.android.util.getActivity
 import io.homeassistant.companion.android.webview.WebViewActivity
@@ -57,6 +59,8 @@ internal fun NavController.navigateToFrontend(
  * @param onConfigureHomeNetwork Callback to configure home network (receives serverId)
  * @param onSecurityLevelHelpClick Callback when user taps help on security level screen
  * @param onShowSnackbar Callback to show snackbar messages
+ * @param onShowServerSwitcher Callback to display the server switcher bottom sheet. Receives an
+ *   `onServerSelected` callback that must be invoked with the chosen server ID.
  */
 internal fun NavGraphBuilder.frontendScreen(
     navController: NavController,
@@ -66,13 +70,19 @@ internal fun NavGraphBuilder.frontendScreen(
     onOpenLocationSettings: () -> Unit,
     onConfigureHomeNetwork: (serverId: Int) -> Unit,
     onShowSnackbar: suspend (message: String, action: String?) -> Boolean,
+    onShowServerSwitcher: (onServerSelected: (Int) -> Unit) -> Unit,
 ) {
     if (WIPFeature.USE_FRONTEND_V2) {
         composable<FrontendRoute> {
             val viewModel: FrontendViewModel = hiltViewModel()
 
-            FrontendNavigationHandler(
-                navigationEvents = viewModel.navigationEvents,
+            val nfcWriteLauncher = rememberLauncherForActivityResult(WriteNfcTag()) { messageId ->
+                viewModel.onNfcWriteCompleted(messageId)
+            }
+
+            FrontendEventHandler(
+                events = viewModel.events,
+                onShowSnackbar = onShowSnackbar,
                 onNavigateToSettings = onNavigateToSettings,
                 onNavigateToAssist = { serverId, pipelineId, startListening ->
                     navController.context.startActivity(
@@ -83,6 +93,11 @@ internal fun NavGraphBuilder.frontendScreen(
                             startListening = startListening,
                         ),
                     )
+                },
+                onOpenExternalLink = onOpenExternalLink,
+                onShowServerSwitcher = { onShowServerSwitcher(viewModel::switchServer) },
+                onNavigateToNfcWrite = { messageId, tagId ->
+                    nfcWriteLauncher.launch(WriteNfcTag.Input(tagId = tagId, messageId = messageId))
                 },
             )
 
@@ -112,28 +127,55 @@ internal fun NavGraphBuilder.frontendScreen(
 }
 
 /**
- * Handles navigation side effects for [FrontendViewState].
+ * Handles one-shot events from the [FrontendViewModel].
+ *
+ * Collects [FrontendEvent]s and performs the appropriate action
  */
 @Composable
 @VisibleForTesting
-internal fun FrontendNavigationHandler(
-    navigationEvents: SharedFlow<FrontendNavigationEvent>,
+internal fun FrontendEventHandler(
+    events: SharedFlow<FrontendEvent>,
+    onShowSnackbar: suspend (message: String, action: String?) -> Boolean,
     onNavigateToSettings: (SettingsActivity.Deeplink?) -> Unit,
     onNavigateToAssist: (serverId: Int, pipelineId: String?, startListening: Boolean) -> Unit,
+    onOpenExternalLink: suspend (Uri) -> Unit,
+    onShowServerSwitcher: () -> Unit,
+    onNavigateToNfcWrite: (messageId: Int, tagId: String?) -> Unit,
 ) {
+    val resources = LocalResources.current
     LaunchedEffect(Unit) {
-        navigationEvents.collect { event ->
+        events.collect { event ->
             when (event) {
-                is FrontendNavigationEvent.NavigateToSettings -> {
+                is FrontendEvent.ShowSnackbar -> {
+                    onShowSnackbar(resources.getString(event.messageResId), null)
+                }
+
+                is FrontendEvent.NavigateToSettings -> {
                     onNavigateToSettings(null)
                 }
 
-                is FrontendNavigationEvent.NavigateToAssistSettings -> {
+                is FrontendEvent.NavigateToAssistSettings -> {
                     onNavigateToSettings(SettingsActivity.Deeplink.AssistSettings)
                 }
 
-                is FrontendNavigationEvent.NavigateToAssist -> {
+                is FrontendEvent.NavigateToAssist -> {
                     onNavigateToAssist(event.serverId, event.pipelineId, event.startListening)
+                }
+
+                is FrontendEvent.OpenExternalLink -> {
+                    onOpenExternalLink(event.uri)
+                }
+
+                is FrontendEvent.NavigateToDeveloperSettings -> {
+                    onNavigateToSettings(SettingsActivity.Deeplink.Developer)
+                }
+
+                is FrontendEvent.ShowServerSwitcher -> {
+                    onShowServerSwitcher()
+                }
+
+                is FrontendEvent.NavigateToNfcWrite -> {
+                    onNavigateToNfcWrite(event.messageId, event.tagId)
                 }
             }
         }
