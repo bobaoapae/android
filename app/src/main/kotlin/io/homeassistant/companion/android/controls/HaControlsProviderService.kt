@@ -646,12 +646,19 @@ class HaControlsProviderService : ControlsProviderService() {
                     ?: lastControlEntityIds.keys.firstOrNull() ?: return@forEach
                 val entityId = controlId.removePrefix("$serverId.")
                 if (!entityId.startsWith("camera.")) return@forEach
-                val entity = cachedEntities[serverId]?.get(entityId) ?: return@forEach
+                val cachedEntity = cachedEntities[serverId]?.get(entityId) ?: return@forEach
                 val baseUrl = lastBaseUrl[serverId] ?: return@forEach
-                val entityPicture = entity.attributes["entity_picture"] as? String ?: return@forEach
+                val entityPicture = cachedEntity.attributes["entity_picture"] as? String ?: return@forEach
 
                 // Force refresh
                 CameraControl.prefetchThumbnail(entityId, baseUrl, entityPicture, isInternal = true, force = true)
+
+                // Re-read the entity after the prefetch network round-trip. The parallel
+                // subscribeToEntitiesForServer flow may have written a fresh state into the cache
+                // while the prefetch was in flight, and emitting the stale snapshot captured at
+                // the top of this iteration would race against (and visibly overwrite) the live
+                // controls that subscribeToEntitiesForServer just delivered to the subscriber.
+                val entity = cachedEntities[serverId]?.get(entityId) ?: cachedEntity
 
                 // Re-send the camera control with fresh thumbnail
                 val info = HaControlInfo(
